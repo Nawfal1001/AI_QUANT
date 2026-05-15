@@ -1,18 +1,9 @@
 """
 Bot Runner.
 
-Background asyncio task that:
-1. Loops every 30 seconds
-2. Fetches all enabled bots
-3. For each bot whose schedule window has elapsed:
-   - Loads strategy (built-in or user-defined)
-   - Iterates over its watchlist
-   - Generates signal on each ticker
-   - If signal >= min_confidence, sends order through order router (paper or live broker)
-   - Records execution
-   - Updates next_run_at
-
-Failures are logged and never crash the loop.
+Background asyncio task that runs enabled normal bots concurrently, while
+respecting high-impact news pauses. Emergency macro bots are handled by
+emergency_macro_runner.
 """
 import asyncio
 from datetime import datetime, timedelta
@@ -22,59 +13,23 @@ import pandas as pd
 
 from database import db
 from services.logger import child
-from services.bots import (
-    get_active_bots, record_execution, SCHEDULES,
-)
+from services.bots import get_active_bots, record_execution, SCHEDULES
 from services import data_freshness
 from services.strategies import STRATEGIES
 from services.custom_strategy import run_custom_strategy
 from services.backtest_engine import fetch_history
 from services.adaptive_strategy_selector import select_strategy
+from services.news_guard import should_pause_for_news
 
 log = child("bot_runner")
 
 _running = False
 _task: Optional[asyncio.Task] = None
 
-TIMEFRAME_BY_SCHEDULE = {
-    "1m": "1m",
-    "5m": "5m",
-    "15m": "15m",
-    "30m": "30m",
-    "1h": "1h",
-    "4h": "4h",
-    "1d": "1d",
-}
-
-LOOKBACK_BY_TIMEFRAME = {
-    "1m": timedelta(days=7),
-    "5m": timedelta(days=30),
-    "15m": timedelta(days=45),
-    "30m": timedelta(days=60),
-    "1h": timedelta(days=90),
-    "4h": timedelta(days=180),
-    "1d": timedelta(days=365),
-}
-
-MIN_BARS_BY_TIMEFRAME = {
-    "1m": 80,
-    "5m": 80,
-    "15m": 80,
-    "30m": 80,
-    "1h": 80,
-    "4h": 80,
-    "1d": 30,
-}
-
-WINDOW_BARS_BY_TIMEFRAME = {
-    "1m": 200,
-    "5m": 200,
-    "15m": 200,
-    "30m": 200,
-    "1h": 200,
-    "4h": 200,
-    "1d": 120,
-}
+TIMEFRAME_BY_SCHEDULE = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h", "4h": "4h", "1d": "1d"}
+LOOKBACK_BY_TIMEFRAME = {"1m": timedelta(days=7), "5m": timedelta(days=30), "15m": timedelta(days=45), "30m": timedelta(days=60), "1h": timedelta(days=90), "4h": timedelta(days=180), "1d": timedelta(days=365)}
+MIN_BARS_BY_TIMEFRAME = {"1m": 80, "5m": 80, "15m": 80, "30m": 80, "1h": 80, "4h": 80, "1d": 30}
+WINDOW_BARS_BY_TIMEFRAME = {"1m": 200, "5m": 200, "15m": 200, "30m": 200, "1h": 200, "4h": 200, "1d": 120}
 
 
 def _parse_dt(s: Optional[str]) -> Optional[datetime]:
@@ -103,17 +58,10 @@ async def _fetch_strategy_history(ticker: str, asset_type: str, timeframe: str) 
     lookback = LOOKBACK_BY_TIMEFRAME.get(timeframe, LOOKBACK_BY_TIMEFRAME["1h"])
     end_dt = datetime.utcnow()
     start_dt = end_dt - lookback
-    return await fetch_history(
-        ticker,
-        asset_type,
-        start_dt.strftime("%Y-%m-%d"),
-        end_dt.strftime("%Y-%m-%d"),
-        timeframe,
-    )
+    return await fetch_history(ticker, asset_type, start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"), timeframe)
 
 
 def _detect_local_regime(window: pd.DataFrame) -> Tuple[str, float]:
-    """Fast timeframe-local regime detection from the same bars used by the bot."""
     try:
         if window is None or len(window) < 50:
             return "RANGING", 30.0
@@ -127,73 +75,42 @@ def _detect_local_regime(window: pd.DataFrame) -> Tuple[str, float]:
         ema_fast = close.ewm(span=12, adjust=False).mean().iloc[-1]
         ema_slow = close.ewm(span=26, adjust=False).mean().iloc[-1]
         trend_strength = abs(ema_fast - ema_slow) / close.iloc[-1] * 100
-
         if atr_pct > 1.8 and trend_strength > 0.25:
-            regime = "VOLATILE"
-            confidence = min(90.0, 55.0 + atr_pct * 8)
-        elif trend_strength > 0.35 and recent_ret > recent_vol * 0.25:
-            regime = "TRENDING_BULL"
-            confidence = min(90.0, 55.0 + trend_strength * 30)
-        elif trend_strength > 0.35 and recent_ret < -recent_vol * 0.25:
-            regime = "TRENDING_BEAR"
-            confidence = min(90.0, 55.0 + trend_strength * 30)
-        elif atr_pct < 0.35 and trend_strength < 0.15:
-            regime = "QUIET"
-            confidence = 55.0
-        else:
-            regime = "RANGING"
-            confidence = 55.0
-        return regime, round(confidence, 1)
+            return "VOLATILE", round(min(90.0, 55.0 + atr_pct * 8), 1)
+        if trend_strength > 0.35 and recent_ret > recent_vol * 0.25:
+            return "TRENDING_BULL", round(min(90.0, 55.0 + trend_strength * 30), 1)
+        if trend_strength > 0.35 and recent_ret < -recent_vol * 0.25:
+            return "TRENDING_BEAR", round(min(90.0, 55.0 + trend_strength * 30), 1)
+        if atr_pct < 0.35 and trend_strength < 0.15:
+            return "QUIET", 55.0
+        return "RANGING", 55.0
     except Exception as e:
         log.debug(f"local regime detection failed: {e}")
         return "RANGING", 30.0
 
 
-async def _generate_signal(strategy_type: str, strategy_id: str, user_id: str,
-                            ticker: str, asset_type: str, timeframe: str) -> Optional[dict]:
+async def _generate_signal(strategy_type: str, strategy_id: str, user_id: str, ticker: str, asset_type: str, timeframe: str) -> Optional[dict]:
     try:
         df = await _fetch_strategy_history(ticker, asset_type, timeframe)
     except Exception as e:
         log.warning(f"fetch_history failed for {ticker} {timeframe}: {e}")
         return None
-
     min_bars = MIN_BARS_BY_TIMEFRAME.get(timeframe, 80)
     if df is None or len(df) < min_bars:
         got = 0 if df is None else len(df)
         return {"signal": "HOLD", "confidence": 0, "reason": f"insufficient {timeframe} history ({got}/{min_bars} bars)"}
-
     window = df.iloc[-WINDOW_BARS_BY_TIMEFRAME.get(timeframe, 200):]
     regime, regime_confidence = _detect_local_regime(window)
-
     effective_strategy_id = strategy_id
     selector_decision = None
     if strategy_type == "builtin":
         try:
-            selector_decision = await select_strategy(
-                user_id=user_id,
-                configured_strategy=strategy_id,
-                ticker=ticker,
-                timeframe=timeframe,
-                regime=regime,
-                allow_auto_switch=True,
-                allow_no_trade=True,
-            )
+            selector_decision = await select_strategy(user_id=user_id, configured_strategy=strategy_id, ticker=ticker, timeframe=timeframe, regime=regime, allow_auto_switch=True, allow_no_trade=True)
             if not selector_decision.get("allow_trade", True):
-                return {
-                    "signal": "HOLD",
-                    "confidence": 0,
-                    "reason": selector_decision.get("reason", "adaptive selector blocked trade"),
-                    "timeframe": timeframe,
-                    "bars": len(window),
-                    "regime": regime,
-                    "regime_confidence": regime_confidence,
-                    "selector": selector_decision,
-                }
+                return {"signal": "HOLD", "confidence": 0, "reason": selector_decision.get("reason", "adaptive selector blocked trade"), "timeframe": timeframe, "bars": len(window), "regime": regime, "regime_confidence": regime_confidence, "selector": selector_decision}
             effective_strategy_id = selector_decision.get("selected_strategy") or strategy_id
         except Exception as e:
             log.warning(f"adaptive selector failed for {ticker} {timeframe}: {e}")
-            effective_strategy_id = strategy_id
-
     try:
         if strategy_type == "builtin":
             fn = STRATEGIES.get(effective_strategy_id)
@@ -205,7 +122,6 @@ async def _generate_signal(strategy_type: str, strategy_id: str, user_id: str,
             if not strat_def:
                 return {"signal": "HOLD", "confidence": 0, "reason": "user strategy missing"}
             sig = run_custom_strategy(strat_def, window)
-
         if isinstance(sig, dict):
             sig.setdefault("timeframe", timeframe)
             sig.setdefault("bars", len(window))
@@ -267,9 +183,22 @@ async def _process_bot(bot: dict):
     bot_id = bot["_id"]
     bot_name = bot.get("name", "?")
     timeframe = _timeframe_for_bot(bot)
+
+    guard = await should_pause_for_news(bot)
+    if guard.get("pause"):
+        log.info(f"bot {bot_name} paused: {guard.get('reason')}")
+        await record_execution(user_id, bot_id, "NEWS", "macro", "HOLD", 0, "skipped", reason=guard.get("reason"), order_result=guard)
+        from bson import ObjectId
+        schedule_secs = SCHEDULES.get(bot.get("schedule", "1h"), 3600)
+        now = datetime.utcnow()
+        await db["bots"].update_one({"_id": ObjectId(bot_id)}, {"$set": {"last_run_at": now.isoformat(), "next_run_at": (now + timedelta(seconds=min(schedule_secs, 300))).isoformat(), "last_pause_reason": guard.get("reason")}, "$inc": {"stats.runs": 1, "stats.news_pauses": 1}})
+        return
+
+    if bot.get("bot_role") == "emergency_macro":
+        return
+
     log.info(f"running bot {bot_name} ({bot_id}) for user {user_id} on {timeframe} candles")
     signals_fired = orders_placed = orders_rejected = 0
-
     for item in bot["watchlist"]:
         ticker = item["ticker"].upper()
         asset_type = item.get("asset_type", "stock")
@@ -277,68 +206,53 @@ async def _process_bot(bot: dict):
         if not sig:
             await record_execution(user_id, bot_id, ticker, asset_type, "HOLD", 0, "skipped", reason="signal generation failed")
             continue
-
         signal_str = sig.get("signal", "HOLD")
         confidence = float(sig.get("confidence", 0))
         signal_reason = sig.get("reason", "")
         regime = sig.get("regime", "unknown")
         strategy_used = sig.get("strategy_used", bot.get("strategy_id"))
         selector = sig.get("selector")
-
-        if signal_str == "HOLD" or "BUY" not in signal_str and "SELL" not in signal_str:
-            await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "skipped",
-                                   reason=signal_reason or f"HOLD signal on {timeframe} {regime}")
+        if signal_str == "HOLD" or ("BUY" not in signal_str and "SELL" not in signal_str):
+            await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "skipped", reason=signal_reason or f"HOLD signal on {timeframe} {regime}")
             continue
         if confidence < bot.get("min_confidence", 60):
-            await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "skipped",
-                                   reason=f"below min_confidence ({confidence} < {bot['min_confidence']}) on {timeframe} {regime}")
+            await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "skipped", reason=f"below min_confidence ({confidence} < {bot['min_confidence']}) on {timeframe} {regime}")
             continue
-
         signals_fired += 1
         cached = await _ensure_price(ticker, asset_type, timeframe)
         if not cached:
-            await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "rejected",
-                                   reason=f"no fresh price available for {timeframe}")
+            await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "rejected", reason=f"no fresh price available for {timeframe}")
             orders_rejected += 1
             continue
-
         price = cached["price"]
         qty = await _calc_position_size(user_id, bot, price)
         if qty <= 0:
             await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "rejected", reason="size = 0")
             orders_rejected += 1
             continue
-
         side = "buy" if "BUY" in signal_str else "sell"
         broker = bot.get("broker", "paper")
         try:
             if broker == "paper":
                 from services import paper_broker
-                result = await paper_broker.place_order(user_id=user_id, ticker=ticker, side=side, qty=qty,
-                                                        order_type="market", current_price=price,
-                                                        asset_type=asset_type, skip_freshness=False)
+                result = await paper_broker.place_order(user_id=user_id, ticker=ticker, side=side, qty=qty, order_type="market", current_price=price, asset_type=asset_type, skip_freshness=False)
             else:
                 from services.order_router import submit_order
-                result = await submit_order(user_id=user_id, broker_id=broker, ticker=ticker,
-                                            side=side, qty=qty, order_type="market", confirm_live=True)
+                result = await submit_order(user_id=user_id, broker_id=broker, ticker=ticker, side=side, qty=qty, order_type="market", confirm_live=True)
         except Exception as e:
             log.exception(f"bot {bot_name} order failed for {ticker}: {e}")
             await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "rejected", reason=f"order error: {e}")
             orders_rejected += 1
             continue
-
         status = result.get("status")
         result.setdefault("bot_context", {"timeframe": timeframe, "regime": regime, "strategy_used": strategy_used, "selector": selector})
-        if status == "filled" or status == "submitted":
+        if status in {"filled", "submitted"}:
             orders_placed += 1
-            await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "placed",
-                                   order_result=result, reason=f"{timeframe} {regime} strategy={strategy_used}")
+            await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "placed", order_result=result, reason=f"{timeframe} {regime} strategy={strategy_used}")
             log.info(f"bot {bot_name} placed {side} {qty:.4f} {ticker} @ {price:.2f} (sig {confidence}% {timeframe} {regime} {strategy_used})")
         else:
             orders_rejected += 1
-            await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "rejected",
-                                   order_result=result, reason=result.get("reason") or result.get("message", "unknown"))
-
+            await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "rejected", order_result=result, reason=result.get("reason") or result.get("message", "unknown"))
     from bson import ObjectId
     schedule_secs = SCHEDULES.get(bot.get("schedule", "1h"), 3600)
     now = datetime.utcnow()
