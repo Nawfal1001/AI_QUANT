@@ -20,6 +20,7 @@ from services.custom_strategy import run_custom_strategy
 from services.backtest_engine import fetch_history
 from services.adaptive_strategy_selector import select_strategy
 from services.news_guard import should_pause_for_news
+from services.signal_confidence import calibrate_signal_confidence
 
 log = child("bot_runner")
 
@@ -206,17 +207,22 @@ async def _process_bot(bot: dict):
         if not sig:
             await record_execution(user_id, bot_id, ticker, asset_type, "HOLD", 0, "skipped", reason="signal generation failed")
             continue
+        try:
+            sig = await calibrate_signal_confidence(user_id, ticker, asset_type, sig, bot=bot)
+        except Exception as e:
+            log.warning(f"confidence calibration failed for {ticker}: {e}")
         signal_str = sig.get("signal", "HOLD")
         confidence = float(sig.get("confidence", 0))
         signal_reason = sig.get("reason", "")
         regime = sig.get("regime", "unknown")
         strategy_used = sig.get("strategy_used", bot.get("strategy_id"))
         selector = sig.get("selector")
+        calibration = sig.get("calibration")
         if signal_str == "HOLD" or ("BUY" not in signal_str and "SELL" not in signal_str):
-            await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "skipped", reason=signal_reason or f"HOLD signal on {timeframe} {regime}")
+            await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "skipped", reason=signal_reason or f"HOLD signal on {timeframe} {regime}", order_result={"calibration": calibration} if calibration else None)
             continue
         if confidence < bot.get("min_confidence", 60):
-            await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "skipped", reason=f"below min_confidence ({confidence} < {bot['min_confidence']}) on {timeframe} {regime}")
+            await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "skipped", reason=f"below calibrated min_confidence ({confidence} < {bot['min_confidence']}) on {timeframe} {regime}", order_result={"calibration": calibration} if calibration else None)
             continue
         signals_fired += 1
         cached = await _ensure_price(ticker, asset_type, timeframe)
@@ -245,11 +251,11 @@ async def _process_bot(bot: dict):
             orders_rejected += 1
             continue
         status = result.get("status")
-        result.setdefault("bot_context", {"timeframe": timeframe, "regime": regime, "strategy_used": strategy_used, "selector": selector})
+        result.setdefault("bot_context", {"timeframe": timeframe, "regime": regime, "strategy_used": strategy_used, "selector": selector, "calibration": calibration})
         if status in {"filled", "submitted"}:
             orders_placed += 1
-            await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "placed", order_result=result, reason=f"{timeframe} {regime} strategy={strategy_used}")
-            log.info(f"bot {bot_name} placed {side} {qty:.4f} {ticker} @ {price:.2f} (sig {confidence}% {timeframe} {regime} {strategy_used})")
+            await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "placed", order_result=result, reason=f"{timeframe} {regime} strategy={strategy_used} calibrated_conf={confidence}")
+            log.info(f"bot {bot_name} placed {side} {qty:.4f} {ticker} @ {price:.2f} (calibrated sig {confidence}% {timeframe} {regime} {strategy_used})")
         else:
             orders_rejected += 1
             await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "rejected", order_result=result, reason=result.get("reason") or result.get("message", "unknown"))
