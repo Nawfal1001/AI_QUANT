@@ -1,15 +1,15 @@
 """
 Dynamic Symbol Scanner.
 
-Ranks a universe of symbols for watchlist updates using:
+Ranks a broker-compatible universe of symbols for watchlist updates using:
 - market momentum
 - volume expansion
 - volatility / tradability
 - simple RSS sentiment
 - optional Gemini AI sentiment
 
-It also has an emergency mover scan for sudden price/volume spikes between
-normal daily/hourly scans and can discover newly listed Binance USDT symbols.
+Supports broker-aware universes so bots do not receive symbols their broker
+cannot trade. Crypto discovery uses Binance USDT spot markets.
 """
 from __future__ import annotations
 
@@ -31,6 +31,16 @@ col_scan_cache = db["symbol_scan_cache"]
 
 DEFAULT_CRYPTO_UNIVERSE = ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "AVAX", "LINK", "DOT", "TRX", "MATIC", "LTC", "BCH", "ATOM", "NEAR", "APT", "ARB", "OP", "INJ"]
 DEFAULT_STOCK_UNIVERSE = ["AAPL", "MSFT", "NVDA", "TSLA", "META", "AMZN", "GOOGL", "AMD", "NFLX", "COIN"]
+DEFAULT_FOREX_UNIVERSE = ["EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "AUD_USD", "USD_CAD", "NZD_USD", "EUR_GBP", "EUR_JPY", "GBP_JPY"]
+
+BROKER_DEFAULT_ASSET_TYPE = {
+    "binance": "crypto",
+    "kucoin": "crypto",
+    "coinbase": "crypto",
+    "alpaca": "stock",
+    "oanda": "forex",
+    "paper": "crypto",
+}
 
 POSITIVE_WORDS = ["surge", "gain", "bull", "beat", "rise", "growth", "profit", "strong", "up", "record", "upgrade", "rally", "breakout"]
 NEGATIVE_WORDS = ["drop", "fall", "bear", "miss", "loss", "weak", "crash", "concern", "down", "downgrade", "lawsuit", "probe", "selloff"]
@@ -51,6 +61,16 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
         return default
 
 
+def normalize_broker_id(broker_id: Optional[str]) -> str:
+    return (broker_id or "paper").lower().strip()
+
+
+def infer_asset_type_for_broker(broker_id: Optional[str], asset_type: Optional[str] = None) -> str:
+    if asset_type:
+        return asset_type
+    return BROKER_DEFAULT_ASSET_TYPE.get(normalize_broker_id(broker_id), "crypto")
+
+
 def _is_tradable_base(base: str) -> bool:
     base = base.upper()
     if base in STABLE_OR_LEVERAGED:
@@ -60,9 +80,8 @@ def _is_tradable_base(base: str) -> bool:
     return True
 
 
-async def discover_crypto_universe(limit: int = 120, min_quote_volume_usdt: float = 2_000_000) -> List[str]:
-    """Discover active Binance spot USDT symbols so new listings can enter scans."""
-    cached = await col_scan_cache.find_one({"kind": "crypto_universe", "exchange": "binance"})
+async def discover_crypto_universe(exchange_id: str = "binance", limit: int = 120, min_quote_volume_usdt: float = 2_000_000) -> List[str]:
+    cached = await col_scan_cache.find_one({"kind": "crypto_universe", "exchange": exchange_id})
     if cached:
         ts = datetime.fromisoformat(cached.get("updated_at"))
         if datetime.utcnow() - ts < timedelta(hours=6):
@@ -70,7 +89,8 @@ async def discover_crypto_universe(limit: int = 120, min_quote_volume_usdt: floa
 
     def _fetch_symbols():
         import ccxt
-        ex = ccxt.binance({"enableRateLimit": True})
+        ex_cls = getattr(ccxt, exchange_id, ccxt.binance)
+        ex = ex_cls({"enableRateLimit": True})
         markets = ex.load_markets()
         tickers = ex.fetch_tickers()
         rows = []
@@ -82,8 +102,7 @@ async def discover_crypto_universe(limit: int = 120, min_quote_volume_usdt: floa
             base = market.get("base", "").upper()
             if not _is_tradable_base(base):
                 continue
-            ticker = tickers.get(symbol, {}) or {}
-            quote_volume = _safe_float(ticker.get("quoteVolume"), 0)
+            quote_volume = _safe_float((tickers.get(symbol, {}) or {}).get("quoteVolume"), 0)
             if quote_volume < min_quote_volume_usdt:
                 continue
             rows.append((base, quote_volume))
@@ -100,19 +119,27 @@ async def discover_crypto_universe(limit: int = 120, min_quote_volume_usdt: floa
         loop = asyncio.get_event_loop()
         symbols = await loop.run_in_executor(None, _fetch_symbols)
     except Exception as e:
-        log.warning(f"crypto universe discovery failed: {e}")
+        log.warning(f"crypto universe discovery failed for {exchange_id}: {e}")
         symbols = DEFAULT_CRYPTO_UNIVERSE
 
-    await col_scan_cache.replace_one({"kind": "crypto_universe", "exchange": "binance"}, {"kind": "crypto_universe", "exchange": "binance", "symbols": symbols, "updated_at": datetime.utcnow().isoformat()}, upsert=True)
+    await col_scan_cache.replace_one({"kind": "crypto_universe", "exchange": exchange_id}, {"kind": "crypto_universe", "exchange": exchange_id, "symbols": symbols, "updated_at": datetime.utcnow().isoformat()}, upsert=True)
     return symbols
 
 
-async def resolve_universe(universe: Optional[List[str]], asset_type: str, discover: bool = True) -> List[str]:
+async def resolve_universe(universe: Optional[List[str]], asset_type: str, discover: bool = True, broker_id: Optional[str] = None) -> List[str]:
     if universe:
         return [s.upper().strip() for s in universe if s and isinstance(s, str)]
-    if asset_type == "crypto" and discover:
-        return await discover_crypto_universe()
-    return DEFAULT_CRYPTO_UNIVERSE if asset_type == "crypto" else DEFAULT_STOCK_UNIVERSE
+    broker = normalize_broker_id(broker_id)
+    if asset_type == "crypto":
+        if discover and broker in {"binance", "kucoin", "coinbase", "paper"}:
+            exchange = "binance" if broker == "paper" else broker
+            return await discover_crypto_universe(exchange_id=exchange)
+        return DEFAULT_CRYPTO_UNIVERSE
+    if asset_type == "stock":
+        return DEFAULT_STOCK_UNIVERSE
+    if asset_type == "forex":
+        return DEFAULT_FOREX_UNIVERSE
+    return DEFAULT_CRYPTO_UNIVERSE
 
 
 def _score_sentiment_from_headlines(headlines: List[str]) -> Dict[str, Any]:
@@ -238,12 +265,13 @@ async def score_symbol(ticker: str, asset_type: str = "crypto", interval: str = 
     return {"ticker": ticker.upper(), "asset_type": asset_type, "score": combined["score"], "reason": combined["reason"], "market": market, "news": news, "ai": ai}
 
 
-async def scan_universe(universe: Optional[List[str]] = None, asset_type: str = "crypto", interval: str = "1d", limit: int = 10, use_ai: bool = False, discover: bool = True) -> Dict[str, Any]:
-    universe = await resolve_universe(universe, asset_type, discover=discover)
+async def scan_universe(universe: Optional[List[str]] = None, asset_type: Optional[str] = None, interval: str = "1d", limit: int = 10, use_ai: bool = False, discover: bool = True, broker_id: Optional[str] = None) -> Dict[str, Any]:
+    asset_type = infer_asset_type_for_broker(broker_id, asset_type)
+    universe = await resolve_universe(universe, asset_type, discover=discover, broker_id=broker_id)
     results = await asyncio.gather(*[score_symbol(s, asset_type=asset_type, interval=interval, use_ai=use_ai) for s in universe], return_exceptions=True)
     ranked = [r for r in results if isinstance(r, dict)]
     ranked.sort(key=lambda x: x.get("score", 0), reverse=True)
-    run = {"kind": "normal", "asset_type": asset_type, "interval": interval, "limit": limit, "use_ai": use_ai, "discover": discover, "universe_size": len(universe), "selected": ranked[:limit], "ranked": ranked, "created_at": datetime.utcnow().isoformat()}
+    run = {"kind": "normal", "broker_id": normalize_broker_id(broker_id), "asset_type": asset_type, "interval": interval, "limit": limit, "use_ai": use_ai, "discover": discover, "universe_size": len(universe), "selected": ranked[:limit], "ranked": ranked, "created_at": datetime.utcnow().isoformat()}
     try:
         await col_scan_runs.insert_one(run)
     except Exception as e:
@@ -251,8 +279,9 @@ async def scan_universe(universe: Optional[List[str]] = None, asset_type: str = 
     return {k: v for k, v in run.items() if k != "_id"}
 
 
-async def scan_emergency_movers(universe: Optional[List[str]] = None, asset_type: str = "crypto", interval: str = "15m", limit: int = 5, use_ai: bool = False, discover: bool = True) -> Dict[str, Any]:
-    universe = await resolve_universe(universe, asset_type, discover=discover)
+async def scan_emergency_movers(universe: Optional[List[str]] = None, asset_type: Optional[str] = None, interval: str = "15m", limit: int = 5, use_ai: bool = False, discover: bool = True, broker_id: Optional[str] = None) -> Dict[str, Any]:
+    asset_type = infer_asset_type_for_broker(broker_id, asset_type)
+    universe = await resolve_universe(universe, asset_type, discover=discover, broker_id=broker_id)
     results = await asyncio.gather(*[fetch_intraday_spike_features(s, asset_type, interval) for s in universe], return_exceptions=True)
     movers = [r for r in results if isinstance(r, dict) and r.get("spike")]
     movers.sort(key=lambda x: x.get("spike_score", 0), reverse=True)
@@ -265,7 +294,7 @@ async def scan_emergency_movers(universe: Optional[List[str]] = None, asset_type
         final_score = _clamp(m.get("spike_score", 0) + sentiment_boost + ai_boost)
         enriched.append({**m, "asset_type": asset_type, "score": round(final_score, 2), "news": news, "ai": ai, "reason": f"sudden move {m.get('ret_4bar_pct')}%/{interval}; volume x{m.get('volume_ratio')}; news {news.get('sentiment')}"})
     enriched.sort(key=lambda x: x.get("score", 0), reverse=True)
-    run = {"kind": "emergency", "asset_type": asset_type, "interval": interval, "limit": limit, "use_ai": use_ai, "discover": discover, "universe_size": len(universe), "selected": enriched[:limit], "ranked": enriched, "created_at": datetime.utcnow().isoformat()}
+    run = {"kind": "emergency", "broker_id": normalize_broker_id(broker_id), "asset_type": asset_type, "interval": interval, "limit": limit, "use_ai": use_ai, "discover": discover, "universe_size": len(universe), "selected": enriched[:limit], "ranked": enriched, "created_at": datetime.utcnow().isoformat()}
     try:
         await col_scan_runs.insert_one(run)
     except Exception as e:
@@ -273,26 +302,50 @@ async def scan_emergency_movers(universe: Optional[List[str]] = None, asset_type
     return {k: v for k, v in run.items() if k != "_id"}
 
 
-async def update_dynamic_bot_watchlists(asset_type: str = "crypto", interval: str = "1d", limit: int = 10, use_ai: bool = False, discover: bool = True) -> Dict[str, Any]:
-    scan = await scan_universe(asset_type=asset_type, interval=interval, limit=limit, use_ai=use_ai, discover=discover)
-    watchlist = [{"ticker": x["ticker"], "asset_type": x.get("asset_type", asset_type)} for x in scan["selected"]]
-    res = await db["bots"].update_many({"use_dynamic_watchlist": True, "dynamic_asset_type": asset_type}, {"$set": {"watchlist": watchlist, "last_watchlist_scan_at": datetime.utcnow().isoformat(), "last_watchlist_scan_score": [{"ticker": x["ticker"], "score": x["score"], "reason": x["reason"]} for x in scan["selected"]]}})
-    return {"updated_bots": res.modified_count, "watchlist": watchlist, "scan": scan}
-
-
-async def promote_emergency_movers(asset_type: str = "crypto", interval: str = "15m", limit: int = 3, use_ai: bool = False, min_score: float = 75, discover: bool = True) -> Dict[str, Any]:
-    scan = await scan_emergency_movers(asset_type=asset_type, interval=interval, limit=limit, use_ai=use_ai, discover=discover)
-    movers = [x for x in scan["selected"] if x.get("score", 0) >= min_score]
-    bots = await db["bots"].find({"use_dynamic_watchlist": True, "dynamic_asset_type": asset_type}).to_list(200)
+async def update_dynamic_bot_watchlists(asset_type: Optional[str] = None, interval: str = "1d", limit: int = 10, use_ai: bool = False, discover: bool = True, broker_id: Optional[str] = None) -> Dict[str, Any]:
+    query = {"use_dynamic_watchlist": True}
+    if broker_id:
+        query["broker"] = broker_id
+    if asset_type:
+        query["dynamic_asset_type"] = asset_type
+    bots = await db["bots"].find(query).to_list(200)
     updated = 0
+    results = []
     for bot in bots:
+        bot_broker = bot.get("broker", broker_id or "paper")
+        bot_asset = infer_asset_type_for_broker(bot_broker, bot.get("dynamic_asset_type") or asset_type)
+        bot_limit = int(bot.get("dynamic_max_watchlist", limit) or limit)
+        scan = await scan_universe(asset_type=bot_asset, interval=interval, limit=bot_limit, use_ai=use_ai, discover=discover, broker_id=bot_broker)
+        watchlist = [{"ticker": x["ticker"], "asset_type": x.get("asset_type", bot_asset)} for x in scan["selected"]]
+        await db["bots"].update_one({"_id": bot["_id"]}, {"$set": {"watchlist": watchlist, "last_watchlist_scan_at": datetime.utcnow().isoformat(), "last_watchlist_scan_score": [{"ticker": x["ticker"], "score": x["score"], "reason": x["reason"]} for x in scan["selected"]]}})
+        updated += 1
+        results.append({"bot_id": str(bot["_id"]), "broker": bot_broker, "asset_type": bot_asset, "watchlist": watchlist})
+    return {"updated_bots": updated, "results": results}
+
+
+async def promote_emergency_movers(asset_type: Optional[str] = None, interval: str = "15m", limit: int = 3, use_ai: bool = False, min_score: float = 75, discover: bool = True, broker_id: Optional[str] = None) -> Dict[str, Any]:
+    query = {"use_dynamic_watchlist": True}
+    if broker_id:
+        query["broker"] = broker_id
+    if asset_type:
+        query["dynamic_asset_type"] = asset_type
+    bots = await db["bots"].find(query).to_list(200)
+    updated = 0
+    results = []
+    for bot in bots:
+        bot_broker = bot.get("broker", broker_id or "paper")
+        bot_asset = infer_asset_type_for_broker(bot_broker, bot.get("dynamic_asset_type") or asset_type)
+        scan = await scan_emergency_movers(asset_type=bot_asset, interval=interval, limit=limit, use_ai=use_ai, discover=discover, broker_id=bot_broker)
+        movers = [x for x in scan["selected"] if x.get("score", 0) >= min_score]
         current = bot.get("watchlist", []) or []
         seen = {x.get("ticker", "").upper() for x in current}
-        additions = [{"ticker": m["ticker"], "asset_type": asset_type} for m in movers if m["ticker"] not in seen]
+        additions = [{"ticker": m["ticker"], "asset_type": bot_asset} for m in movers if m["ticker"] not in seen]
         if not additions:
+            results.append({"bot_id": str(bot["_id"]), "broker": bot_broker, "asset_type": bot_asset, "added": []})
             continue
         max_len = int(bot.get("dynamic_max_watchlist", 10) or 10)
         new_watchlist = (additions + current)[:max_len]
         await db["bots"].update_one({"_id": bot["_id"]}, {"$set": {"watchlist": new_watchlist, "last_emergency_scan_at": datetime.utcnow().isoformat(), "last_emergency_movers": [{"ticker": m["ticker"], "score": m["score"], "reason": m["reason"]} for m in movers]}})
         updated += 1
-    return {"updated_bots": updated, "movers": movers, "scan": scan}
+        results.append({"bot_id": str(bot["_id"]), "broker": bot_broker, "asset_type": bot_asset, "added": additions})
+    return {"updated_bots": updated, "results": results}
