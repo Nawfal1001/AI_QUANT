@@ -5,7 +5,6 @@ Order placement flow:
 - POST /broker/order -> order_router.submit_order
 - That goes through risk + idempotency + live-mode gate + adapter
 """
-import base64
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -15,30 +14,11 @@ from middleware.auth import get_current_user
 from services.brokers import make_adapter, BrokerError
 from services.order_router import submit_order, list_live_orders, cancel_live_order, sync_broker_positions
 from services.logger import child
+from services.credential_crypto import encrypt_secret, decrypt_secret, mask_secret
 
 log = child("broker_router")
 router = APIRouter()
 col = db["brokers"]
-
-
-def _obscure(s: str) -> str:
-    return base64.b64encode(s.encode()).decode() if s else ""
-
-
-def _reveal(s: str) -> str:
-    if not s:
-        return ""
-    try:
-        return base64.b64decode(s.encode()).decode()
-    except Exception:
-        return ""
-
-
-def _mask(s: str) -> str:
-    if not s or len(s) < 6:
-        return "****"
-    return s[:3] + "****" + s[-3:]
-
 
 BROKER_SPECS = [
     {"id": "alpaca", "name": "Alpaca", "type": "stocks", "fields": ["api_key", "api_secret"], "supports_paper": True, "docs_url": "https://alpaca.markets/docs/"},
@@ -49,13 +29,11 @@ BROKER_SPECS = [
 
 @router.get("/available")
 async def available():
-    # Public: lists supported brokers + required field names. No user data.
     return {"brokers": BROKER_SPECS}
 
 
 @router.post("/connect")
 async def connect(data: dict, user=Depends(get_current_user)):
-    """Connect or update broker credentials. Tests live by calling the adapter."""
     broker = data.get("broker")
     if broker not in [b["id"] for b in BROKER_SPECS]:
         raise HTTPException(400, f"Unsupported broker: {broker}")
@@ -68,11 +46,10 @@ async def connect(data: dict, user=Depends(get_current_user)):
         if not v:
             raise HTTPException(400, f"Missing field: {f}")
         creds_plain[f] = v
-        creds_obscured[f] = _obscure(v)
+        creds_obscured[f] = encrypt_secret(v)
 
     paper_mode = bool(data.get("paper_mode", True))
 
-    # Test via adapter
     try:
         adapter = make_adapter(broker, creds_plain, paper_mode=paper_mode)
         test = await adapter.test_connection()
@@ -114,7 +91,7 @@ async def status(user=Depends(get_current_user)):
             "paper_mode": d.get("paper_mode", True),
             "balance": d.get("balance"),
             "connected_at": d.get("connected_at"),
-            "api_key_masked": _mask(_reveal(d.get("credentials", {}).get("api_key", ""))),
+            "api_key_masked": mask_secret(decrypt_secret(d.get("credentials", {}).get("api_key", ""))),
         })
     return {"connected": out}
 
@@ -127,7 +104,6 @@ async def disconnect(broker: str, user=Depends(get_current_user)):
 
 @router.post("/order")
 async def order(data: dict, user=Depends(get_current_user)):
-    """Place a real broker order. Goes through risk + idempotency + adapter."""
     broker = data.get("broker", "alpaca")
     ticker = data.get("ticker", "").upper()
     side = data.get("side", "buy")
@@ -150,7 +126,6 @@ async def order(data: dict, user=Depends(get_current_user)):
         confirm_live=confirm_live,
     )
     if result.get("status") == "rejected":
-        # 400 so the frontend treats it as a user error, not server error
         raise HTTPException(400, result.get("reason") or result.get("message") or "Order rejected")
     return result
 
@@ -167,21 +142,18 @@ async def cancel(broker: str, broker_order_id: str, user=Depends(get_current_use
 
 @router.get("/positions/{broker}")
 async def positions(broker: str, user=Depends(get_current_user)):
-    """Fetch positions directly from the broker (live, not cached)."""
     return {"positions": await sync_broker_positions(user["id"], broker)}
 
 
 @router.get("/balance/{broker}")
 async def balance(broker: str, user=Depends(get_current_user)):
-    """Fetch fresh balance from the broker."""
     doc = await col.find_one({"user_id": user["id"], "broker_id": broker})
     if not doc:
         raise HTTPException(404, f"Broker {broker} not connected")
-    creds = {k: _reveal(v) for k, v in doc.get("credentials", {}).items()}
+    creds = {k: decrypt_secret(v) for k, v in doc.get("credentials", {}).items()}
     try:
         adapter = make_adapter(broker, creds, paper_mode=doc.get("paper_mode", True))
         bal = await adapter.get_balance()
-        # Update cached value
         await col.update_one({"_id": doc["_id"]}, {"$set": {"balance": bal}})
         return {"broker": broker, "balance": bal}
     except BrokerError as e:
