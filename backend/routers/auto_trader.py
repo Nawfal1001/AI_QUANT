@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from middleware.auth import get_current_user, require_admin, scope_filter
 from services.auto_trader import (
@@ -16,16 +16,16 @@ async def config(user=Depends(get_current_user)):
     return await get_config()
 
 
+# The auto_trader config is a single global document; mutations touch every
+# user's scheduling and risk parameters, so only admins may change it.
 @router.patch("/config")
-async def upd(d: dict, user=Depends(get_current_user)):
-    # If user tries to enable, require risk limits to be configured first
+async def upd(d: dict, user=Depends(require_admin)):
     if d.get("enabled") is True:
         if not await risk_engine.is_configured(user["id"]):
             raise HTTPException(400, "Risk limits not configured. Set them in Settings first.")
     return await update_config(d)
 
 
-# Admin-only: scheduler thread is global
 @router.post("/start")
 async def start(user=Depends(require_admin)):
     return await start_scheduler()
@@ -37,12 +37,12 @@ async def stop(user=Depends(require_admin)):
 
 
 @router.post("/scan-now")
-async def scan(user=Depends(get_current_user)):
+async def scan(user=Depends(require_admin)):
     return await scan_and_execute()
 
 
 @router.post("/monitor-now")
-async def monitor(user=Depends(get_current_user)):
+async def monitor(user=Depends(require_admin)):
     return await monitor_open()
 
 
@@ -56,7 +56,7 @@ async def open_trades(user=Depends(get_current_user)):
 
 
 @router.get("/trade-history")
-async def history(limit: int = 50, user=Depends(get_current_user)):
+async def history(limit: int = Query(50, ge=1, le=500), user=Depends(get_current_user)):
     q = scope_filter(user)
     trades = await db["trade_history"].find(q).sort("closed_at", -1).limit(limit).to_list(limit)
     for t in trades:

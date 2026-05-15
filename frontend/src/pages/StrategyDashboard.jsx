@@ -18,7 +18,7 @@ export default function StrategyDashboard() {
     try {
       const [s, h, p, w] = await Promise.all([
         api.get('/strategy/strategies'), api.get('/strategy/history?limit=30'),
-        api.get('/strategy/pending'), api.get('/walkforward/weights').catch(() => ({ data: { weights: {} } }))
+        api.get('/strategy/pending'), api.get('/signal-perf/weights').catch(() => ({ data: { weights: {} } }))
       ])
       setStrategies(s.data?.strategies || []); setRegimeHist(h.data?.history || [])
       setPending(p.data?.pending || []); setWeights(w.data?.weights || {})

@@ -3,7 +3,7 @@ from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional
 
 from database import db
-from routers.auth import get_current_user
+from middleware.auth import get_current_user, require_admin
 from services.economic_event_engine import (
     upsert_economic_event,
     process_economic_event,
@@ -52,9 +52,10 @@ async def status(user=Depends(get_current_user)):
 
 
 @router.post("/events")
-async def create_or_update_event(payload: EconomicEventIn, user=Depends(get_current_user)):
+async def create_or_update_event(payload: EconomicEventIn, user=Depends(require_admin)):
+    """Macro events drive global trading decisions; admin only."""
     doc = payload.model_dump(exclude_none=True)
-    doc["created_by"] = user["id"] if isinstance(user, dict) else str(user)
+    doc["created_by"] = user["id"]
     return await upsert_economic_event(doc)
 
 
@@ -67,12 +68,12 @@ async def list_events(limit: int = Query(50, ge=1, le=200), user=Depends(get_cur
 
 
 @router.post("/events/process-due")
-async def process_due(user=Depends(get_current_user)):
+async def process_due(user=Depends(require_admin)):
     return await process_due_events(use_ai=True)
 
 
 @router.post("/events/{event_id}/process")
-async def process_event(event_id: str, user=Depends(get_current_user)):
+async def process_event(event_id: str, user=Depends(require_admin)):
     ev = await db["economic_events"].find_one({"event_id": event_id})
     if not ev:
         return {"status": "not_found", "event_id": event_id}

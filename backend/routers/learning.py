@@ -1,5 +1,7 @@
 """Learning & Self-Improvement endpoints — auth required."""
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel, Field
+from typing import Optional
 
 from middleware.auth import get_current_user, require_admin
 from services.meta_learner import train_meta_learner, predict_signal_quality, get_model_info
@@ -69,7 +71,11 @@ async def memory_lookup(d: dict, user=Depends(get_current_user)):
 
 # WFO
 @router.post("/wfo/run")
-async def wfo_run(window_days: int = 90, n_candidates: int = 30, user=Depends(get_current_user)):
+async def wfo_run(
+    window_days: int = Query(90, ge=7, le=365),
+    n_candidates: int = Query(30, ge=1, le=200),
+    user=Depends(get_current_user),
+):
     return await run_wfo(window_days, n_candidates)
 
 
@@ -86,7 +92,7 @@ async def wfo_start(user=Depends(require_admin)):
 
 # Hyper Tuner
 @router.post("/tuner/run")
-async def tuner_run(n_trials: int = 40, user=Depends(get_current_user)):
+async def tuner_run(n_trials: int = Query(40, ge=1, le=500), user=Depends(get_current_user)):
     return await run_tuning(n_trials)
 
 
@@ -111,9 +117,19 @@ async def def_state(user=Depends(get_current_user)):
     return await get_state()
 
 
+class DefensiveThresholdsIn(BaseModel):
+    warn_dd_pct: Optional[float] = Field(None, ge=0, le=100)
+    defensive_dd_pct: Optional[float] = Field(None, ge=0, le=100)
+    halt_dd_pct: Optional[float] = Field(None, ge=0, le=100)
+
+
 @router.patch("/defensive/thresholds")
-async def def_thresholds(d: dict, user=Depends(get_current_user)):
-    return await update_thresholds(d)
+async def def_thresholds(d: DefensiveThresholdsIn, user=Depends(require_admin)):
+    """Defensive thresholds gate all users; admin only with validated payload."""
+    payload = {k: v for k, v in d.model_dump().items() if v is not None}
+    if not payload:
+        return {"status": "noop"}
+    return await update_thresholds(payload)
 
 
 @router.get("/defensive/pnl-24h")

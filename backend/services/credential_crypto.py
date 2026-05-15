@@ -1,7 +1,11 @@
 """Credential encryption helpers.
 
-New broker credentials are encrypted with Fernet when CREDENTIALS_ENCRYPTION_KEY is set.
-Legacy Base64-obscured values remain readable for backward compatibility.
+New broker credentials are encrypted with Fernet when CREDENTIALS_ENCRYPTION_KEY
+is set. Legacy Base64-obscured values remain readable so existing connections
+keep working until the user rotates them.
+
+Generate a key:
+    python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 """
 import base64
 import os
@@ -27,7 +31,11 @@ def encryption_available() -> bool:
 
 
 def encrypt_secret(value: str) -> str:
-    """Encrypt a secret if configured; otherwise fall back to legacy Base64."""
+    """Encrypt a secret if a key is configured; otherwise fall back to legacy Base64.
+
+    In production you MUST set CREDENTIALS_ENCRYPTION_KEY — the Base64 fallback
+    is only for migrating existing deployments.
+    """
     if not value:
         return ""
     fernet = _get_fernet()
@@ -58,3 +66,8 @@ def mask_secret(value: str) -> str:
     if not value or len(value) < 6:
         return "****"
     return value[:3] + "****" + value[-3:]
+
+
+# Back-compat aliases for code paths that referenced the older shorthand names.
+encrypt = encrypt_secret
+decrypt = decrypt_secret

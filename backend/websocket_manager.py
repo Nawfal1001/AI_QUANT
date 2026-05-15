@@ -113,7 +113,13 @@ async def broadcast_loop():
             if manager.subs:
                 all_t = list(manager.subs.keys())
                 by_type = {"stock": [t for t in all_t if t not in CRYPTO], "crypto": [t for t in all_t if t in CRYPTO]}
-                prices = await loop.run_in_executor(None, _fetch, by_type)
+                # Cap each cycle at 10s so a hung yfinance/ccxt call cannot stall
+                # the whole websocket fanout.
+                try:
+                    prices = await asyncio.wait_for(loop.run_in_executor(None, _fetch, by_type), timeout=10)
+                except asyncio.TimeoutError:
+                    log.warning("broadcast_loop fetch timeout")
+                    prices = {}
                 now = datetime.utcnow().isoformat()
                 for ticker, d in prices.items():
                     await manager.broadcast(ticker, {
@@ -124,13 +130,26 @@ async def broadcast_loop():
                         "timestamp": now,
                     })
 
-                # Also feed the data_freshness cache so order placement can use it
                 try:
                     from services.data_freshness import set_price
                     for ticker, d in prices.items():
                         set_price(ticker, d.get("price", 0), ttl_sec=15, source="ws")
                 except Exception as e:
                     log.debug(f"freshness cache update failed: {e}")
+
+                # Also trip any resting paper limit/stop orders against the new prices.
+                try:
+                    from services.paper_broker import match_resting_orders
+                    price_map = {t: d.get("price", 0) for t, d in prices.items()}
+                    await match_resting_orders(price_map)
+                except Exception as e:
+                    log.debug(f"paper resting-order match failed: {e}")
+        except asyncio.CancelledError:
+            log.info("broadcast_loop cancelled")
+            return
         except Exception as e:
             log.exception(f"broadcast_loop error: {e}")
-        await asyncio.sleep(3)
+        try:
+            await asyncio.sleep(3)
+        except asyncio.CancelledError:
+            return

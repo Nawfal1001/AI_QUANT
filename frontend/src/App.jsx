@@ -3,6 +3,7 @@ import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { Toaster } from 'react-hot-toast'
 import Layout from '@/components/Layout'
 import ProtectedRoute from '@/components/ProtectedRoute'
+import ErrorBoundary from '@/components/ErrorBoundary'
 import { useAuthStore } from '@/store/auth'
 import { Loading } from '@/components/ui'
 import AuthPage from '@/pages/AuthPage'
@@ -41,6 +42,7 @@ export default function App() {
   }
 
   return (
+    <ErrorBoundary>
     <BrowserRouter>
       <Toaster position="top-right" toastOptions={{ style: { background: '#161b22', color: '#e2e8f0', border: '1px solid #21262d' } }} />
       <Routes>
@@ -66,5 +68,6 @@ export default function App() {
         <Route path="*" element={<Navigate to="/dashboard" replace />} />
       </Routes>
     </BrowserRouter>
+    </ErrorBoundary>
   )
 }

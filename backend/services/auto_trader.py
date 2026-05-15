@@ -137,7 +137,7 @@ async def scan_and_execute():
                "entry_price":entry,"quantity":round(qty,6),"position_value":round(capital*pos_pct/100,2),
                "position_pct":round(pos_pct,2),"sl":round(sl,4),"tp":round(tp,4),"atr":round(atr_val,4),
                "regime":regime,"timeframe":tf,"status":"open","paper_mode":config.get("paper_mode",True),
-               "opened_at":datetime.now().isoformat(),
+               "opened_at":datetime.utcnow().isoformat(),
                "quant_powered":config.get("use_quant",True),
                "rl_state":rl_state_key,"rl_action":rl_action_idx,"rl_size_mult":rl_size_mult,
                "meta_p_win":meta.get("p_win",None),
@@ -161,20 +161,31 @@ async def scan_and_execute():
 async def monitor_open():
     trades=await trades_col.find({"status":"open"}).to_list(100)
     if not trades: return {"monitored":0}
-    import yfinance as yf, ccxt
+    from services import data_freshness
+    from services.backtest_engine import fetch_history
     closed=[]
     for trade in trades:
         ticker=trade["ticker"]; atype=trade.get("asset_type","stock")
         entry=float(trade.get("entry_price",0)); sl=float(trade.get("sl",0)); tp=float(trade.get("tp",0))
         sig=trade.get("signal","BUY")
-        try:
-            loop=asyncio.get_event_loop()
-            if atype=="stock":
-                price=float(await loop.run_in_executor(None,lambda: yf.Ticker(ticker).info.get("regularMarketPrice",0)))
-            else:
-                price=float((await loop.run_in_executor(None,lambda: ccxt.binance().fetch_ticker(f"{ticker}/USDT"))).get("last",0))
-        except: continue
-        if price<=0: continue
+        # Prefer the freshness cache (WS-fed), fall back to a recent bar close. Avoids
+        # yfinance .info which is 15-min delayed and would trigger false SL/TP fills.
+        price = 0.0
+        cached = data_freshness.get_price(ticker)
+        if cached and not cached.get("expired"):
+            price = float(cached.get("price", 0) or 0)
+        if price <= 0:
+            try:
+                end_dt = datetime.utcnow()
+                start_dt = end_dt - timedelta(days=2)
+                df = await fetch_history(ticker, atype, start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"), "1h")
+                if df is not None and len(df):
+                    price = float(df["close"].iloc[-1])
+            except Exception as e:
+                _log.debug(f"monitor price fetch failed for {ticker}: {e}")
+                continue
+        if price <= 0:
+            continue
 
         hit_sl=price<=sl if "BUY" in sig else price>=sl
         hit_tp=price>=tp if "BUY" in sig else price<=tp
@@ -184,10 +195,10 @@ async def monitor_open():
             outcome="WIN" if hit_tp else "LOSS"
             close_reason="TP" if hit_tp else "SL"
             await trades_col.update_one({"_id":trade["_id"]},{"$set":{"status":"closed","close_price":price,
-                "close_reason":close_reason,"pnl_pct":round(pnl,3),"outcome":outcome,"closed_at":datetime.now().isoformat()}})
+                "close_reason":close_reason,"pnl_pct":round(pnl,3),"outcome":outcome,"closed_at":datetime.utcnow().isoformat()}})
 
             history_record={**{k:v for k,v in trade.items() if k!="_id"},"close_price":price,
-                "pnl_pct":round(pnl,3),"outcome":outcome,"closed_at":datetime.now().isoformat()}
+                "pnl_pct":round(pnl,3),"outcome":outcome,"closed_at":datetime.utcnow().isoformat()}
             await hist_col.insert_one(history_record)
             closed.append({"ticker":ticker,"outcome":outcome,"pnl":round(pnl,3)})
 

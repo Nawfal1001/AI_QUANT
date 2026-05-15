@@ -23,8 +23,8 @@ async def resolve_one(s):
     sig=s.get("signal",""); entry=float(s.get("price",0))
     if not entry or not sig or sig=="HOLD": return {"resolved":False}
     try: st=datetime.fromisoformat(s.get("timestamp",""))
-    except: return {"resolved":False}
-    if datetime.now()<st+timedelta(hours=DELAYS.get(tf,48)): return {"resolved":False,"reason":"Too early"}
+    except Exception: return {"resolved":False}
+    if datetime.utcnow()<st+timedelta(hours=DELAYS.get(tf,48)): return {"resolved":False,"reason":"Too early"}
     loop=asyncio.get_event_loop(); price=await loop.run_in_executor(None,_price,ticker,atype)
     if price<=0: return {"resolved":False}
     move=(price-entry)/entry*100; min_m=MIN_MOVE.get(tf,1.0); is_buy="BUY" in sig
@@ -38,7 +38,7 @@ async def resolve_one(s):
         else: return {"resolved":False,"reason":f"Pending {move:.2f}%"}
     outcome="WIN" if correct else "LOSS"; pnl=abs(move) if correct else -abs(move)
     await scol.update_one({"_id":s["_id"]},{"$set":{"outcome":outcome,"outcome_price":price,
-        "outcome_date":datetime.now().isoformat(),"correct":correct,"pnl_pct":round(pnl,3)}})
+        "outcome_date":datetime.utcnow().isoformat(),"correct":correct,"pnl_pct":round(pnl,3)}})
 
     # SELF-LEARNING LOOPS
     if s.get("indicators"):

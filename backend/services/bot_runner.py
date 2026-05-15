@@ -26,6 +26,7 @@ log = child("bot_runner")
 
 _running = False
 _task: Optional[asyncio.Task] = None
+_concurrency = asyncio.Semaphore(8)
 
 TIMEFRAME_BY_SCHEDULE = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h", "4h": "4h", "1d": "1d"}
 LOOKBACK_BY_TIMEFRAME = {"1m": timedelta(days=7), "5m": timedelta(days=30), "15m": timedelta(days=45), "30m": timedelta(days=60), "1h": timedelta(days=90), "4h": timedelta(days=180), "1d": timedelta(days=365)}
@@ -180,16 +181,22 @@ async def _ensure_price(ticker: str, asset_type: str, timeframe: str) -> Optiona
 
 
 async def _process_bot(bot: dict):
+    async with _concurrency:
+        await _process_bot_inner(bot)
+
+
+async def _process_bot_inner(bot: dict):
     user_id = bot["user_id"]
     bot_id = bot["_id"]
     bot_name = bot.get("name", "?")
     timeframe = _timeframe_for_bot(bot)
+    signals_fired = orders_placed = orders_rejected = 0
+    from bson import ObjectId
 
     guard = await should_pause_for_news(bot)
     if guard.get("pause"):
         log.info(f"bot {bot_name} paused: {guard.get('reason')}")
         await record_execution(user_id, bot_id, "NEWS", "macro", "HOLD", 0, "skipped", reason=guard.get("reason"), order_result=guard)
-        from bson import ObjectId
         schedule_secs = SCHEDULES.get(bot.get("schedule", "1h"), 3600)
         now = datetime.utcnow()
         await db["bots"].update_one({"_id": ObjectId(bot_id)}, {"$set": {"last_run_at": now.isoformat(), "next_run_at": (now + timedelta(seconds=min(schedule_secs, 300))).isoformat(), "last_pause_reason": guard.get("reason")}, "$inc": {"stats.runs": 1, "stats.news_pauses": 1}})
@@ -199,70 +206,96 @@ async def _process_bot(bot: dict):
         return
 
     log.info(f"running bot {bot_name} ({bot_id}) for user {user_id} on {timeframe} candles")
-    signals_fired = orders_placed = orders_rejected = 0
-    for item in bot["watchlist"]:
-        ticker = item["ticker"].upper()
-        asset_type = item.get("asset_type", "stock")
-        sig = await _generate_signal(bot["strategy_type"], bot["strategy_id"], user_id, ticker, asset_type, timeframe)
-        if not sig:
-            await record_execution(user_id, bot_id, ticker, asset_type, "HOLD", 0, "skipped", reason="signal generation failed")
-            continue
-        try:
-            sig = await calibrate_signal_confidence(user_id, ticker, asset_type, sig, bot=bot)
-        except Exception as e:
-            log.warning(f"confidence calibration failed for {ticker}: {e}")
-        signal_str = sig.get("signal", "HOLD")
-        confidence = float(sig.get("confidence", 0))
-        signal_reason = sig.get("reason", "")
-        regime = sig.get("regime", "unknown")
-        strategy_used = sig.get("strategy_used", bot.get("strategy_id"))
-        selector = sig.get("selector")
-        calibration = sig.get("calibration")
-        if signal_str == "HOLD" or ("BUY" not in signal_str and "SELL" not in signal_str):
-            await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "skipped", reason=signal_reason or f"HOLD signal on {timeframe} {regime}", order_result={"calibration": calibration} if calibration else None)
-            continue
-        if confidence < bot.get("min_confidence", 60):
-            await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "skipped", reason=f"below calibrated min_confidence ({confidence} < {bot['min_confidence']}) on {timeframe} {regime}", order_result={"calibration": calibration} if calibration else None)
-            continue
-        signals_fired += 1
-        cached = await _ensure_price(ticker, asset_type, timeframe)
-        if not cached:
-            await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "rejected", reason=f"no fresh price available for {timeframe}")
-            orders_rejected += 1
-            continue
-        price = cached["price"]
-        qty = await _calc_position_size(user_id, bot, price)
-        if qty <= 0:
-            await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "rejected", reason="size = 0")
-            orders_rejected += 1
-            continue
-        side = "buy" if "BUY" in signal_str else "sell"
-        broker = bot.get("broker", "paper")
-        try:
-            if broker == "paper":
-                from services import paper_broker
-                result = await paper_broker.place_order(user_id=user_id, ticker=ticker, side=side, qty=qty, order_type="market", current_price=price, asset_type=asset_type, skip_freshness=False)
+    try:
+        for item in bot["watchlist"]:
+            ticker = item["ticker"].upper()
+            asset_type = item.get("asset_type", "stock")
+            sig = await _generate_signal(bot["strategy_type"], bot["strategy_id"], user_id, ticker, asset_type, timeframe)
+            if not sig:
+                await record_execution(user_id, bot_id, ticker, asset_type, "HOLD", 0, "skipped", reason="signal generation failed")
+                continue
+            try:
+                sig = await calibrate_signal_confidence(user_id, ticker, asset_type, sig, bot=bot)
+            except Exception as e:
+                log.warning(f"confidence calibration failed for {ticker}: {e}")
+            signal_str = sig.get("signal", "HOLD")
+            confidence = float(sig.get("confidence", 0))
+            signal_reason = sig.get("reason", "")
+            regime = sig.get("regime", "unknown")
+            strategy_used = sig.get("strategy_used", bot.get("strategy_id"))
+            selector = sig.get("selector")
+            calibration = sig.get("calibration")
+            if signal_str == "HOLD" or ("BUY" not in signal_str and "SELL" not in signal_str):
+                await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "skipped", reason=signal_reason or f"HOLD signal on {timeframe} {regime}", order_result={"calibration": calibration} if calibration else None)
+                continue
+            if confidence < bot.get("min_confidence", 60):
+                await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "skipped", reason=f"below calibrated min_confidence ({confidence} < {bot['min_confidence']}) on {timeframe} {regime}", order_result={"calibration": calibration} if calibration else None)
+                continue
+            signals_fired += 1
+            cached = await _ensure_price(ticker, asset_type, timeframe)
+            if not cached:
+                await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "rejected", reason=f"no fresh price available for {timeframe}")
+                orders_rejected += 1
+                continue
+            price = cached["price"]
+            qty = await _calc_position_size(user_id, bot, price)
+            if qty <= 0:
+                await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "rejected", reason="size = 0")
+                orders_rejected += 1
+                continue
+            side = "buy" if "BUY" in signal_str else "sell"
+            broker = bot.get("broker", "paper")
+            try:
+                if broker == "paper":
+                    from services import paper_broker
+                    result = await paper_broker.place_order(
+                        user_id=user_id, ticker=ticker, side=side, qty=qty,
+                        order_type="market", current_price=price, asset_type=asset_type,
+                        skip_freshness=False,
+                        strategy=strategy_used, timeframe=timeframe, regime=regime,
+                    )
+                else:
+                    from services.order_router import submit_order
+                    result = await submit_order(user_id=user_id, broker_id=broker, ticker=ticker, side=side, qty=qty, order_type="market", confirm_live=True)
+            except Exception as e:
+                log.exception(f"bot {bot_name} order failed for {ticker}: {e}")
+                await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "rejected", reason=f"order error: {e}")
+                orders_rejected += 1
+                continue
+            status = result.get("status")
+            result.setdefault("bot_context", {"timeframe": timeframe, "regime": regime, "strategy_used": strategy_used, "selector": selector, "calibration": calibration})
+            if status in {"filled", "submitted"}:
+                orders_placed += 1
+                await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "placed", order_result=result, reason=f"{timeframe} {regime} strategy={strategy_used} calibrated_conf={confidence}")
+                log.info(f"bot {bot_name} placed {side} {qty:.4f} {ticker} @ {price:.2f} (calibrated sig {confidence}% {timeframe} {regime} {strategy_used})")
             else:
-                from services.order_router import submit_order
-                result = await submit_order(user_id=user_id, broker_id=broker, ticker=ticker, side=side, qty=qty, order_type="market", confirm_live=True)
+                orders_rejected += 1
+                await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "rejected", order_result=result, reason=result.get("reason") or result.get("message", "unknown"))
+    except Exception as e:
+        log.exception(f"bot {bot_name} processing crashed: {e}")
+    finally:
+        # Always advance next_run_at so a transient crash doesn't tight-loop the bot.
+        schedule_secs = SCHEDULES.get(bot.get("schedule", "1h"), 3600)
+        now = datetime.utcnow()
+        try:
+            await db["bots"].update_one(
+                {"_id": ObjectId(bot_id)},
+                {
+                    "$set": {
+                        "last_run_at": now.isoformat(),
+                        "next_run_at": (now + timedelta(seconds=schedule_secs)).isoformat(),
+                        "last_timeframe": timeframe,
+                    },
+                    "$inc": {
+                        "stats.runs": 1,
+                        "stats.signals_fired": signals_fired,
+                        "stats.orders_placed": orders_placed,
+                        "stats.orders_rejected": orders_rejected,
+                    },
+                },
+            )
         except Exception as e:
-            log.exception(f"bot {bot_name} order failed for {ticker}: {e}")
-            await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "rejected", reason=f"order error: {e}")
-            orders_rejected += 1
-            continue
-        status = result.get("status")
-        result.setdefault("bot_context", {"timeframe": timeframe, "regime": regime, "strategy_used": strategy_used, "selector": selector, "calibration": calibration})
-        if status in {"filled", "submitted"}:
-            orders_placed += 1
-            await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "placed", order_result=result, reason=f"{timeframe} {regime} strategy={strategy_used} calibrated_conf={confidence}")
-            log.info(f"bot {bot_name} placed {side} {qty:.4f} {ticker} @ {price:.2f} (calibrated sig {confidence}% {timeframe} {regime} {strategy_used})")
-        else:
-            orders_rejected += 1
-            await record_execution(user_id, bot_id, ticker, asset_type, signal_str, confidence, "rejected", order_result=result, reason=result.get("reason") or result.get("message", "unknown"))
-    from bson import ObjectId
-    schedule_secs = SCHEDULES.get(bot.get("schedule", "1h"), 3600)
-    now = datetime.utcnow()
-    await db["bots"].update_one({"_id": ObjectId(bot_id)}, {"$set": {"last_run_at": now.isoformat(), "next_run_at": (now + timedelta(seconds=schedule_secs)).isoformat(), "last_timeframe": timeframe}, "$inc": {"stats.runs": 1, "stats.signals_fired": signals_fired, "stats.orders_placed": orders_placed, "stats.orders_rejected": orders_rejected}})
+            log.warning(f"bot {bot_name} schedule update failed: {e}")
 
 
 async def _runner_loop():

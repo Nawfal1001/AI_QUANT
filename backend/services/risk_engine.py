@@ -28,6 +28,8 @@ REQUIRED_FIELDS = [
 col_limits = db["risk_limits"]
 col_state = db["risk_state"]    # caches daily-loss tracker, peak equity per user
 col_trades = db["trades"]
+col_paper_accounts = db["paper_accounts"]
+col_paper_positions = db["paper_positions"]
 
 
 async def get_limits(user_id: str) -> Optional[dict]:
@@ -97,17 +99,35 @@ async def get_open_trade_count(user_id: str) -> int:
 
 
 async def get_account_equity(user_id: str) -> float:
-    """Mark-to-market equity = realized PnL all-time + starting capital (10k default)."""
+    """Mark-to-market equity.
+
+    Prefers the paper_accounts cash balance plus mark-to-market value of open paper
+    positions when a paper account exists for the user. Falls back to
+    starting_capital (configured per-user in risk_state) + cumulative realized PnL
+    so live-only users still get a reasonable equity figure.
+    """
+    acct = await col_paper_accounts.find_one({"user_id": user_id})
+    if acct:
+        cash = float(acct.get("cash", acct.get("starting_capital", 0)) or 0)
+        # Mark-to-market open paper positions against the freshness cache.
+        from services import data_freshness
+        positions = await col_paper_positions.find({"user_id": user_id}).to_list(500)
+        mv = 0.0
+        for p in positions:
+            qty = float(p.get("qty", 0) or 0)
+            cached = data_freshness.get_price(p.get("ticker", ""))
+            price = (cached["price"] if cached else None) or float(p.get("avg_entry", 0) or 0)
+            mv += qty * price
+        return cash + mv
+
     state = await col_state.find_one({"user_id": user_id}) or {}
     starting = float(state.get("starting_capital", 10000))
-
     pipeline = [
         {"$match": {"user_id": user_id, "status": "closed"}},
         {"$group": {"_id": None, "pnl": {"$sum": "$pnl"}}},
     ]
-    cursor = col_trades.aggregate(pipeline)
     realized = 0.0
-    async for r in cursor:
+    async for r in col_trades.aggregate(pipeline):
         realized = float(r.get("pnl", 0) or 0)
     return starting + realized
 

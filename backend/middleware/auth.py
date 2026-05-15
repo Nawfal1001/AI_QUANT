@@ -14,6 +14,9 @@ bearer = HTTPBearer(auto_error=False)
 optional_bearer = HTTPBearer(auto_error=False)
 
 JWT_ALGO = "HS256"
+JWT_ISSUER = os.getenv("JWT_ISSUER", "tradeai")
+JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "tradeai-clients")
+
 UNSAFE_SECRETS = {"", "tradeai_secret_change_me", "change_me", "secret", "test"}
 
 
@@ -40,7 +43,20 @@ def _decode(token: str) -> dict:
     if _secret_is_insecure(secret):
         raise HTTPException(500, "Server misconfigured: JWT_SECRET not set securely")
     try:
-        return jwt.decode(token, secret, algorithms=[JWT_ALGO])
+        # Accept tokens minted before iss/aud were added — only enforce when the
+        # token actually carries those claims — but always require exp.
+        return jwt.decode(
+            token, secret, algorithms=[JWT_ALGO],
+            audience=JWT_AUDIENCE, issuer=JWT_ISSUER,
+            options={"require": ["exp", "sub"], "verify_aud": True, "verify_iss": True},
+        )
+    except jwt.MissingRequiredClaimError:
+        # Legacy token without iss/aud — accept once but downgrade verification.
+        try:
+            return jwt.decode(token, secret, algorithms=[JWT_ALGO], options={"require": ["exp", "sub"]})
+        except jwt.InvalidTokenError as e:
+            log.warning(f"Invalid legacy token: {e}")
+            raise HTTPException(401, "Invalid token")
     except jwt.ExpiredSignatureError:
         raise HTTPException(401, "Token expired")
     except jwt.InvalidTokenError as e:

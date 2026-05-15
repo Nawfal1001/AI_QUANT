@@ -1,5 +1,5 @@
 """Signal performance router — user-scoped."""
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from middleware.auth import get_current_user
 from services import signal_tracker
 
@@ -7,7 +7,7 @@ router = APIRouter()
 
 
 @router.get("/recent")
-async def recent(limit: int = 50, user=Depends(get_current_user)):
+async def recent(limit: int = Query(50, ge=1, le=500), user=Depends(get_current_user)):
     return {"signals": await signal_tracker.recent_signals(user["id"], limit)}
 
 
@@ -43,10 +43,15 @@ async def log_one(payload: dict, user=Depends(get_current_user)):
 
 @router.post("/resolve/{signal_id}")
 async def resolve(signal_id: str, payload: dict, user=Depends(get_current_user)):
+    try:
+        pnl_pct = float(payload.get("pnl_pct", 0))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "pnl_pct must be numeric")
     res = await signal_tracker.resolve_signal(
         signal_id=signal_id,
         outcome=payload.get("outcome", "expired"),
-        pnl_pct=float(payload.get("pnl_pct", 0)),
+        pnl_pct=pnl_pct,
+        user_id=user["id"],
     )
     if "error" in res:
         raise HTTPException(400, res["error"])
