@@ -1,7 +1,7 @@
 """
 Auth service: register / login / refresh / user lookup.
-- Reads JWT_SECRET from env (validated by middleware)
-- Logs all auth events
+- Reads JWT_SECRET from env dynamically.
+- Logs all auth events.
 """
 import os
 from datetime import datetime, timedelta, timezone
@@ -15,7 +15,6 @@ from services.logger import child
 log = child("auth")
 users = db["users"]
 
-JWT_SECRET = os.getenv("JWT_SECRET", "")
 JWT_ALGO = "HS256"
 JWT_ISSUER = os.getenv("JWT_ISSUER", "tradeai")
 JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "tradeai-clients")
@@ -29,6 +28,10 @@ BCRYPT_MAX_BYTES = 72
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _jwt_secret() -> str:
+    return os.getenv("JWT_SECRET", "")
 
 
 def hash_pw(p: str) -> str:
@@ -48,7 +51,8 @@ def verify_pw(p: str, h: str) -> bool:
 
 
 def make_token(uid: str, kind: str = "access") -> str:
-    if not JWT_SECRET or len(JWT_SECRET) < 32:
+    secret = _jwt_secret()
+    if not secret or len(secret) < 32:
         raise RuntimeError("JWT_SECRET not configured. Set it in .env (32+ random chars).")
     ttl = ACCESS_TTL_MIN if kind == "access" else REFRESH_TTL_MIN
     now = _utc_now()
@@ -61,7 +65,7 @@ def make_token(uid: str, kind: str = "access") -> str:
         "nbf": now,
         "exp": now + timedelta(minutes=ttl),
     }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+    return jwt.encode(payload, secret, algorithm=JWT_ALGO)
 
 
 async def register(email: str, password: str, username: str):
@@ -148,14 +152,19 @@ async def login(email: str, password: str):
 
 
 async def refresh(token: str):
-    if not JWT_SECRET or len(JWT_SECRET) < 32:
+    secret = _jwt_secret()
+    if not secret or len(secret) < 32:
         return {"error": "Server misconfigured"}
     try:
-        p = jwt.decode(
-            token, JWT_SECRET, algorithms=[JWT_ALGO],
-            audience=JWT_AUDIENCE, issuer=JWT_ISSUER,
-            options={"require": ["exp", "sub", "type"]},
-        )
+        try:
+            p = jwt.decode(
+                token, secret, algorithms=[JWT_ALGO],
+                audience=JWT_AUDIENCE, issuer=JWT_ISSUER,
+                options={"require": ["exp", "sub", "type"]},
+            )
+        except jwt.MissingRequiredClaimError:
+            # Legacy token without iss/aud
+            p = jwt.decode(token, secret, algorithms=[JWT_ALGO], options={"require": ["exp", "sub"]})
         if p.get("type") != "refresh":
             return {"error": "Wrong token type"}
         return {"access_token": make_token(p["sub"])}

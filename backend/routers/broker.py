@@ -5,36 +5,25 @@ Order placement flow:
 - POST /broker/order -> order_router.submit_order
 - That goes through risk + idempotency + live-mode gate + adapter
 """
+import re
 from datetime import datetime
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from typing import Optional
 
 from database import db
 from middleware.auth import get_current_user
 from services.brokers import make_adapter, BrokerError
 from services.order_router import submit_order, list_live_orders, cancel_live_order, sync_broker_positions
-from services.credential_crypto import encrypt as _encrypt, decrypt as _decrypt
+from services.credential_crypto import encrypt_secret, decrypt_secret, mask_secret
 from services.logger import child
 
 log = child("broker_router")
 router = APIRouter()
 col = db["brokers"]
 
-
-def _obscure(s: str) -> str:
-    return _encrypt(s) if s else ""
-
-
-def _reveal(s: str) -> str:
-    return _decrypt(s) if s else ""
-
-
-def _mask(s: str) -> str:
-    if not s or len(s) < 6:
-        return "****"
-    return s[:3] + "****" + s[-3:]
+TICKER_RE = re.compile(r"^[A-Z0-9._\-/]{1,20}$")
 
 
 BROKER_SPECS = [
@@ -67,11 +56,10 @@ async def connect(data: dict, user=Depends(get_current_user)):
         if len(v) > 512:
             raise HTTPException(400, f"Field too long: {f}")
         creds_plain[f] = v
-        creds_obscured[f] = _obscure(v)
+        creds_obscured[f] = encrypt_secret(v)
 
     paper_mode = bool(data.get("paper_mode", True))
 
-    # Test via adapter
     try:
         adapter = make_adapter(broker, creds_plain, paper_mode=paper_mode)
         test = await adapter.test_connection()
@@ -114,7 +102,7 @@ async def status(user=Depends(get_current_user)):
             "paper_mode": d.get("paper_mode", True),
             "balance": d.get("balance"),
             "connected_at": d.get("connected_at"),
-            "api_key_masked": _mask(_reveal(d.get("credentials", {}).get("api_key", ""))),
+            "api_key_masked": mask_secret(decrypt_secret(d.get("credentials", {}).get("api_key", ""))),
         })
     return {"connected": out}
 
@@ -123,10 +111,6 @@ async def status(user=Depends(get_current_user)):
 async def disconnect(broker: str, user=Depends(get_current_user)):
     res = await col.delete_one({"user_id": user["id"], "broker_id": broker})
     return {"deleted": res.deleted_count, "broker": broker}
-
-
-import re
-TICKER_RE = re.compile(r"^[A-Z0-9._\-/]{1,20}$")
 
 
 class BrokerOrderIn(BaseModel):
@@ -185,7 +169,7 @@ async def balance(broker: str, user=Depends(get_current_user)):
     doc = await col.find_one({"user_id": user["id"], "broker_id": broker})
     if not doc:
         raise HTTPException(404, f"Broker {broker} not connected")
-    creds = {k: _reveal(v) for k, v in doc.get("credentials", {}).items()}
+    creds = {k: decrypt_secret(v) for k, v in doc.get("credentials", {}).items()}
     try:
         adapter = make_adapter(broker, creds, paper_mode=doc.get("paper_mode", True))
         bal = await adapter.get_balance()

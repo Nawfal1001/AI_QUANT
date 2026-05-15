@@ -13,14 +13,23 @@ from services.logger import log
 bearer = HTTPBearer(auto_error=False)
 optional_bearer = HTTPBearer(auto_error=False)
 
-JWT_SECRET = os.getenv("JWT_SECRET", "")
 JWT_ALGO = "HS256"
 JWT_ISSUER = os.getenv("JWT_ISSUER", "tradeai")
 JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "tradeai-clients")
 
 UNSAFE_SECRETS = {"", "tradeai_secret_change_me", "change_me", "secret", "test"}
 
-if JWT_SECRET in UNSAFE_SECRETS or len(JWT_SECRET) < 32:
+
+def _jwt_secret() -> str:
+    """Read JWT_SECRET at call time so tests/env loaders can set it before auth use."""
+    return os.getenv("JWT_SECRET", "")
+
+
+def _secret_is_insecure(secret: str) -> bool:
+    return secret in UNSAFE_SECRETS or len(secret) < 32
+
+
+if _secret_is_insecure(_jwt_secret()):
     log.error(
         "JWT_SECRET is missing or insecure. Set JWT_SECRET in .env to a random 32+ char string. "
         "Generate one: python -c 'import secrets; print(secrets.token_urlsafe(48))'"
@@ -30,20 +39,21 @@ if JWT_SECRET in UNSAFE_SECRETS or len(JWT_SECRET) < 32:
 
 
 def _decode(token: str) -> dict:
-    if JWT_SECRET in UNSAFE_SECRETS or len(JWT_SECRET) < 32:
+    secret = _jwt_secret()
+    if _secret_is_insecure(secret):
         raise HTTPException(500, "Server misconfigured: JWT_SECRET not set securely")
     try:
         # Accept tokens minted before iss/aud were added — only enforce when the
         # token actually carries those claims — but always require exp.
         return jwt.decode(
-            token, JWT_SECRET, algorithms=[JWT_ALGO],
+            token, secret, algorithms=[JWT_ALGO],
             audience=JWT_AUDIENCE, issuer=JWT_ISSUER,
             options={"require": ["exp", "sub"], "verify_aud": True, "verify_iss": True},
         )
     except jwt.MissingRequiredClaimError:
         # Legacy token without iss/aud — accept once but downgrade verification.
         try:
-            return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO], options={"require": ["exp", "sub"]})
+            return jwt.decode(token, secret, algorithms=[JWT_ALGO], options={"require": ["exp", "sub"]})
         except jwt.InvalidTokenError as e:
             log.warning(f"Invalid legacy token: {e}")
             raise HTTPException(401, "Invalid token")

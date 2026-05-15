@@ -1,7 +1,8 @@
 import { create } from 'zustand'
 import axios from 'axios'
 const BASE = import.meta.env.VITE_API_URL ? `${import.meta.env.VITE_API_URL}/api` : '/api'
-const api = axios.create({ baseURL: BASE })
+const REQUEST_TIMEOUT_MS = Number(import.meta.env.VITE_API_TIMEOUT_MS || 15000)
+const api = axios.create({ baseURL: BASE, timeout: REQUEST_TIMEOUT_MS })
 api.interceptors.request.use(cfg => {
   const t = localStorage.getItem('access_token')
   if (t) cfg.headers.Authorization = `Bearer ${t}`
@@ -14,7 +15,11 @@ async function _doRefresh() {
   _refreshInFlight = (async () => {
     const refresh = localStorage.getItem('refresh_token')
     if (!refresh) throw new Error('no_refresh_token')
-    const res = await axios.post(`${BASE}/auth/refresh`, { refresh_token: refresh })
+    const res = await axios.post(
+      `${BASE}/auth/refresh`,
+      { refresh_token: refresh },
+      { timeout: REQUEST_TIMEOUT_MS },
+    )
     const token = res.data.access_token
     localStorage.setItem('access_token', token)
     return token
@@ -25,10 +30,11 @@ async function _doRefresh() {
 
 api.interceptors.response.use(r => r, async err => {
   const orig = err.config
-  if (err.response?.status === 401 && !orig._retry) {
+  if (err.response?.status === 401 && orig && !orig._retry) {
     orig._retry = true
     try {
       const token = await _doRefresh()
+      orig.headers = orig.headers || {}
       orig.headers.Authorization = `Bearer ${token}`
       return api(orig)
     } catch {

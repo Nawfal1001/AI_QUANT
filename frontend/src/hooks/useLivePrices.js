@@ -27,11 +27,28 @@ export function useLivePrices(tickers = []) {
   const retryRef = useRef(null)
   const attemptsRef = useRef(0)
   const cancelledRef = useRef(false)
+  const subscribedRef = useRef([])
   const key = [...tickers].sort().join(',')
+
+  const sendSubscription = useCallback((ws) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return
+    const previous = subscribedRef.current
+    if (previous.length > 0) {
+      ws.send(JSON.stringify({ action: 'unsubscribe', tickers: previous }))
+    }
+    if (tickers.length > 0) {
+      ws.send(JSON.stringify({ action: 'subscribe', tickers }))
+    }
+    subscribedRef.current = tickers
+  }, [key])
 
   const connect = useCallback(() => {
     if (cancelledRef.current) return
-    if (wsRef.current?.readyState === WebSocket.OPEN) return
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      // Already connected — just push the new subscription delta.
+      sendSubscription(wsRef.current)
+      return
+    }
     const url = buildWsUrl()
     if (!url) {
       setError('not_authenticated')
@@ -45,9 +62,7 @@ export function useLivePrices(tickers = []) {
         attemptsRef.current = 0  // reset backoff on successful open
         setConnected(true)
         setError(null)
-        if (tickers.length > 0) {
-          ws.send(JSON.stringify({ action: 'subscribe', tickers }))
-        }
+        sendSubscription(ws)
       }
 
       ws.onmessage = e => {
@@ -68,8 +83,9 @@ export function useLivePrices(tickers = []) {
 
       ws.onclose = (event) => {
         setConnected(false)
+        subscribedRef.current = []
         if (cancelledRef.current) return
-        // 4401 = auth failed; don't auto-retry
+        // 4401 = auth failed; don't auto-retry.
         if (event.code === 4401) {
           setError('auth_failed')
           return
@@ -90,7 +106,7 @@ export function useLivePrices(tickers = []) {
       console.error('WS connect failed', err)
       setError('connect_failed')
     }
-  }, [key])
+  }, [key, sendSubscription])
 
   useEffect(() => {
     cancelledRef.current = false

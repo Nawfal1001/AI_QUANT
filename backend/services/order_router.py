@@ -4,21 +4,18 @@ Live order routing.
 Every live broker order flows through:
 1. Risk engine check (kill switch, daily loss, max DD, max open, position size)
 2. Idempotency check (no duplicate within window)
-3. LIVE_TRADING_ENABLED env gate (must be "true" to actually submit a live order)
-4. Adapter.place_order() — the real broker call
-
-For safety:
-- live orders require both paper_mode=False AND LIVE_TRADING_ENABLED=true in .env
-- The frontend must additionally pass confirm_live=True
+3. Runtime live-trading control gate
+4. Optional frontend/request live confirmation
+5. Adapter.place_order() — the real broker call
 """
 import base64
-import os
 from datetime import datetime
 
 from database import db
 from services import risk_engine, order_idempotency, data_freshness
 from services.brokers import make_adapter, BrokerError
 from services.logger import child
+from services.runtime_controls import get_runtime_controls, is_live_trading_effectively_enabled
 
 log = child("order_router")
 
@@ -33,10 +30,6 @@ def _reveal(s: str) -> str:
         return base64.b64decode(s.encode()).decode()
     except Exception:
         return ""
-
-
-def _is_live_enabled() -> bool:
-    return os.getenv("LIVE_TRADING_ENABLED", "").lower() == "true"
 
 
 async def get_broker_connection(user_id: str, broker_id: str):
@@ -65,58 +58,47 @@ async def submit_order(
     Submit a live (broker) order. Returns a normalized result.
     Reject reasons surface clearly in the "reason" field.
     """
-    # 1. Load adapter
     try:
         adapter, paper_mode = await get_broker_connection(user_id, broker_id)
     except BrokerError as e:
         return {"status": "rejected", "reason": str(e)}
 
-    # 2. Get price for risk check (use cached live price if available)
     cached = data_freshness.get_price(ticker)
     if not cached:
-        # Without a price we can't size the position. Reject conservatively.
         return {"status": "rejected", "reason": f"No live price for {ticker} — start the WS price feed or pass current_price"}
     if cached.get("expired"):
         return {"status": "rejected", "reason": f"Price for {ticker} is stale ({cached['age_sec']:.0f}s old)"}
     price = cached["price"]
     position_size_usd = qty * price
 
-    # 3. Idempotency
     idem = order_idempotency.check_and_record(user_id, ticker, side, qty)
     if not idem["unique"]:
         return {"status": "rejected", "reason": idem["reason"]}
 
-    # 4. Risk engine
     risk = await risk_engine.check_order(user_id, position_size_usd, ticker)
     if not risk["allowed"]:
         order_idempotency.release(idem["key"])
         return {"status": "rejected", "reason": risk["reason"]}
 
-    # 5. Live trading gate
     if not paper_mode:
-        if not _is_live_enabled():
+        controls = await get_runtime_controls()
+        if not await is_live_trading_effectively_enabled():
             order_idempotency.release(idem["key"])
-            return {"status": "rejected", "reason": "Live trading disabled (LIVE_TRADING_ENABLED is not 'true' in .env)"}
-        if not confirm_live:
+            if controls.get("server_live_hard_lock") and not controls.get("frontend_live_override_allowed"):
+                return {"status": "rejected", "reason": "Live trading disabled by server hard lock. Set LIVE_TRADING_ENABLED=true or ALLOW_FRONTEND_LIVE_OVERRIDE=true."}
+            return {"status": "rejected", "reason": "Live trading disabled in runtime controls"}
+        if controls.get("require_live_confirmation", True) and not confirm_live:
             order_idempotency.release(idem["key"])
-            return {"status": "rejected", "reason": "Live order requires confirm_live=true in the request"}
+            return {"status": "rejected", "reason": "Live order requires confirm_live=true"}
 
-    # 6. Submit
     log.info(f"user {user_id} submitting {broker_id} {'paper' if paper_mode else 'LIVE'} order: {side} {qty} {ticker}")
     try:
-        result = await adapter.place_order(
-            ticker=ticker,
-            side=side,
-            qty=qty,
-            order_type=order_type,
-            limit_price=limit_price,
-        )
+        result = await adapter.place_order(ticker=ticker, side=side, qty=qty, order_type=order_type, limit_price=limit_price)
     except Exception as e:
         log.exception(f"adapter.place_order failed: {e}")
         order_idempotency.release(idem["key"])
         return {"status": "rejected", "reason": f"Adapter error: {e}"}
 
-    # 7. Record the order
     record = {
         "user_id": user_id,
         "broker_id": broker_id,
@@ -161,15 +143,11 @@ async def cancel_live_order(user_id: str, broker_id: str, broker_order_id: str) 
         return {"status": "error", "message": str(e)}
     result = await adapter.cancel_order(broker_order_id)
     if result.get("status") == "cancelled":
-        await col_live_orders.update_one(
-            {"user_id": user_id, "broker_id": broker_id, "broker_order_id": broker_order_id},
-            {"$set": {"status": "cancelled", "cancelled_at": datetime.utcnow().isoformat()}},
-        )
+        await col_live_orders.update_one({"user_id": user_id, "broker_id": broker_id, "broker_order_id": broker_order_id}, {"$set": {"status": "cancelled", "cancelled_at": datetime.utcnow().isoformat()}})
     return result
 
 
 async def sync_broker_positions(user_id: str, broker_id: str) -> list:
-    """Fetch fresh positions from the broker and return them."""
     try:
         adapter, _ = await get_broker_connection(user_id, broker_id)
         return await adapter.get_positions()

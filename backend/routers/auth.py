@@ -1,8 +1,9 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel, constr
 from typing import Optional
 
 from services.auth_service import register, login, refresh, update_settings
+from services.rate_limit import check_rate_limit, reset_rate_limit
 from middleware.auth import get_current_user
 
 router = APIRouter()
@@ -34,8 +35,18 @@ class SettingsUpdate(BaseModel):
     ui_density: Optional[str] = None
 
 
+def _client_key(request: Request, email: str) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    ip = forwarded.split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    return f"login:{ip}:{(email or '').lower().strip()}"
+
+
 @router.post("/register")
-async def do_register(r: Reg):
+async def do_register(r: Reg, request: Request):
+    # Rate-limit registration too — same envelope as login.
+    key = f"register:{_client_key(request, r.email).split(':', 1)[1]}"
+    if not check_rate_limit(key, limit=10, window_sec=600):
+        raise HTTPException(429, detail="Too many registration attempts. Try again later.")
     res = await register(r.email, r.password, r.username)
     if "error" in res:
         raise HTTPException(400, detail=res["error"])
@@ -43,10 +54,14 @@ async def do_register(r: Reg):
 
 
 @router.post("/login")
-async def do_login(r: Log):
+async def do_login(r: Log, request: Request):
+    key = _client_key(request, r.email)
+    if not check_rate_limit(key, limit=5, window_sec=300):
+        raise HTTPException(429, detail="Too many login attempts. Try again later.")
     res = await login(r.email, r.password)
     if "error" in res:
         raise HTTPException(401, detail=res["error"])
+    reset_rate_limit(key)
     return res
 
 

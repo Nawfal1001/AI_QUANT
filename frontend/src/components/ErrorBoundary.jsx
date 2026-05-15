@@ -23,7 +23,7 @@ export default class ErrorBoundary extends React.Component {
         <div style={{ maxWidth: 560, background: '#161b22', border: '1px solid #21262d', borderRadius: 10, padding: 24 }}>
           <h2 style={{ marginTop: 0, color: '#f85149' }}>Something went wrong</h2>
           <p style={{ color: '#8b949e', fontSize: 13, marginBottom: 12 }}>
-            A page crashed while rendering. The error has been logged to the console.
+            A page crashed while rendering. Your session is safe; you can try again or reload.
           </p>
           <pre style={{ background: '#0d1117', padding: 12, borderRadius: 6, fontSize: 12, color: '#e3b341', overflow: 'auto', maxHeight: 200 }}>
             {String(this.state.err?.message || this.state.err)}
