@@ -22,10 +22,26 @@ export function useLivePrices(tickers = []) {
   const [error, setError] = useState(null)
   const wsRef = useRef(null)
   const retryRef = useRef(null)
+  const subscribedRef = useRef([])
   const key = [...tickers].sort().join(',')
 
+  const sendSubscription = useCallback((ws) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return
+    const previous = subscribedRef.current
+    if (previous.length > 0) {
+      ws.send(JSON.stringify({ action: 'unsubscribe', tickers: previous }))
+    }
+    if (tickers.length > 0) {
+      ws.send(JSON.stringify({ action: 'subscribe', tickers }))
+    }
+    subscribedRef.current = tickers
+  }, [key])
+
   const connect = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      sendSubscription(wsRef.current)
+      return
+    }
     const url = buildWsUrl()
     if (!url) {
       setError('not_authenticated')
@@ -38,9 +54,7 @@ export function useLivePrices(tickers = []) {
       ws.onopen = () => {
         setConnected(true)
         setError(null)
-        if (tickers.length > 0) {
-          ws.send(JSON.stringify({ action: 'subscribe', tickers }))
-        }
+        sendSubscription(ws)
       }
 
       ws.onmessage = e => {
@@ -55,19 +69,17 @@ export function useLivePrices(tickers = []) {
             setError(d.message || 'ws error')
           }
         } catch (err) {
-          // Bad JSON — log and continue
           console.warn('WS bad message', err)
         }
       }
 
       ws.onclose = (event) => {
         setConnected(false)
-        // 4401 = auth failed; don't auto-retry
+        subscribedRef.current = []
         if (event.code === 4401) {
           setError('auth_failed')
           return
         }
-        // Otherwise reconnect with backoff
         retryRef.current = setTimeout(connect, 5000)
       }
 
@@ -79,7 +91,7 @@ export function useLivePrices(tickers = []) {
       console.error('WS connect failed', err)
       setError('connect_failed')
     }
-  }, [key])
+  }, [key, sendSubscription])
 
   useEffect(() => {
     connect()
