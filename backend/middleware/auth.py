@@ -13,12 +13,20 @@ from services.logger import log
 bearer = HTTPBearer(auto_error=False)
 optional_bearer = HTTPBearer(auto_error=False)
 
-JWT_SECRET = os.getenv("JWT_SECRET", "")
 JWT_ALGO = "HS256"
-
 UNSAFE_SECRETS = {"", "tradeai_secret_change_me", "change_me", "secret", "test"}
 
-if JWT_SECRET in UNSAFE_SECRETS or len(JWT_SECRET) < 32:
+
+def _jwt_secret() -> str:
+    """Read JWT_SECRET at call time so tests/env loaders can set it before auth use."""
+    return os.getenv("JWT_SECRET", "")
+
+
+def _secret_is_insecure(secret: str) -> bool:
+    return secret in UNSAFE_SECRETS or len(secret) < 32
+
+
+if _secret_is_insecure(_jwt_secret()):
     log.error(
         "JWT_SECRET is missing or insecure. Set JWT_SECRET in .env to a random 32+ char string. "
         "Generate one: python -c 'import secrets; print(secrets.token_urlsafe(48))'"
@@ -28,10 +36,11 @@ if JWT_SECRET in UNSAFE_SECRETS or len(JWT_SECRET) < 32:
 
 
 def _decode(token: str) -> dict:
-    if JWT_SECRET in UNSAFE_SECRETS or len(JWT_SECRET) < 32:
+    secret = _jwt_secret()
+    if _secret_is_insecure(secret):
         raise HTTPException(500, "Server misconfigured: JWT_SECRET not set securely")
     try:
-        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+        return jwt.decode(token, secret, algorithms=[JWT_ALGO])
     except jwt.ExpiredSignatureError:
         raise HTTPException(401, "Token expired")
     except jwt.InvalidTokenError as e:
