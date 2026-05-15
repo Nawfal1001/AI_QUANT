@@ -18,9 +18,10 @@ _seen: dict = {}
 DEFAULT_WINDOW_SEC = 60
 
 
-def _make_key(user_id: str, ticker: str, side: str, qty: float, bucket_sec: int = 60) -> str:
-    bucket = int(time.time() // bucket_sec)
-    raw = f"{user_id}|{ticker}|{side}|{qty:.6f}|{bucket}"
+def _make_key(user_id: str, ticker: str, side: str, qty: float) -> str:
+    # Bucketless: the TTL stored against the key handles the dedupe window directly,
+    # so identical orders that straddle a wall-clock minute boundary still collide.
+    raw = f"{user_id}|{ticker.upper()}|{side.lower()}|{qty:.6f}"
     return hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 

@@ -68,8 +68,8 @@ def _validate_definition(data: dict) -> Optional[str]:
     for item in watchlist:
         if not isinstance(item, dict) or "ticker" not in item:
             return "watchlist items must be {ticker, asset_type}"
-        if item.get("asset_type") not in ("stock", "crypto"):
-            return "asset_type must be 'stock' or 'crypto'"
+        if item.get("asset_type") not in ("stock", "crypto", "forex", "oil", "gold", "macro"):
+            return "asset_type must be one of stock | crypto | forex | oil | gold | macro"
 
     if data.get("schedule") not in SCHEDULES:
         return f"schedule must be one of {list(SCHEDULES.keys())}"

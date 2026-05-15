@@ -103,19 +103,76 @@ async def lifespan(app: FastAPI):
 
     from websocket_manager import broadcast_loop
     task = asyncio.create_task(broadcast_loop())
-    log.info("TradeAI v6.1 ready 🚀 (macro emergency system connected)")
-    yield
-    task.cancel()
+    log.info("TradeAI v6.1 ready (macro emergency system connected)")
+    try:
+        yield
+    finally:
+        # Cancel WS broadcast task
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+        # Stop schedulers that expose a stop_*/cancel hook
+        for stopper in [
+            "services.bot_runner.stop_runner",
+            "services.auto_trader.stop_scheduler",
+            "services.signal_resolver.stop_resolver",
+        ]:
+            try:
+                mod_name, fn_name = stopper.rsplit(".", 1)
+                import importlib
+                mod = importlib.import_module(mod_name)
+                fn = getattr(mod, fn_name, None)
+                if fn:
+                    res = fn()
+                    if asyncio.iscoroutine(res):
+                        await res
+            except Exception as e:
+                log.debug(f"shutdown hook {stopper} failed: {e}")
+        # Close DB client
+        try:
+            from database import client as db_client
+            db_client.close()
+        except Exception as e:
+            log.debug(f"DB client close failed: {e}")
 
 
 app = FastAPI(title="TradeAI Platform API", version="6.1.0", lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+_cors_raw = os.getenv("CORS_ORIGINS", "")
+_cors_origins = [o.strip() for o in _cors_raw.split(",") if o.strip()]
+_environment = os.getenv("ENVIRONMENT", "development").lower()
+if "*" in _cors_origins:
+    if _environment == "production":
+        raise RuntimeError("CORS_ORIGINS='*' is not allowed in production with credentials")
+    log.warning("CORS_ORIGINS contains '*' — disabling allow_credentials per browser spec")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "X-Requested-With"],
+    )
+elif _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "X-Requested-With"],
+    )
+else:
+    if _environment == "production":
+        raise RuntimeError("CORS_ORIGINS must be set in production (comma-separated origin list)")
+    log.warning("CORS_ORIGINS unset — defaulting to http://localhost:5173 for dev")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "X-Requested-With"],
+    )
 
 app.include_router(auth.router,        prefix="/api/auth",        tags=["Auth"])
 app.include_router(market.router,      prefix="/api/market",      tags=["Market"])
@@ -143,13 +200,16 @@ app.include_router(macro.router, prefix="/api/macro", tags=["Macro"])
 from websocket_manager import manager
 
 
-async def _ws_authenticate(websocket: WebSocket) -> str:
+UNSAFE_SECRETS = {"tradeai_secret_change_me", "change_me", "secret", "test"}
+
+
+def _ws_authenticate(websocket: WebSocket) -> str:
     import jwt as _jwt
     token = websocket.query_params.get("token")
     if not token:
         return None
     secret = os.getenv("JWT_SECRET", "")
-    if not secret or len(secret) < 32:
+    if not secret or len(secret) < 32 or secret in UNSAFE_SECRETS:
         return None
     try:
         payload = _jwt.decode(token, secret, algorithms=["HS256"])
@@ -162,12 +222,13 @@ async def _ws_authenticate(websocket: WebSocket) -> str:
 
 @app.websocket("/ws/prices")
 async def ws(websocket: WebSocket):
-    await websocket.accept()
-    user_id = await _ws_authenticate(websocket)
+    # Authenticate BEFORE accepting the WS handshake so unauth clients cannot
+    # even open a connection.
+    user_id = _ws_authenticate(websocket)
     if not user_id:
-        await websocket.send_json({"type": "error", "code": 4401, "message": "Auth required"})
         await websocket.close(code=4401)
         return
+    await websocket.accept()
     manager.register_authenticated(websocket, user_id)
     try:
         while True:

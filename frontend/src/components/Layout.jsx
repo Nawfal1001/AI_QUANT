@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useState, useEffect } from 'react'
 import { Outlet, NavLink, useNavigate } from 'react-router-dom'
 import { useStore } from '@/store'
 import { useAuthStore } from '@/store/auth'
@@ -30,8 +30,21 @@ export default function Layout() {
   const { connected } = useLivePrices(['AAPL', 'BTC', 'ETH', 'NVDA'])
   const [collapsed, setCollapsed] = useState(false)
   const [mobileOpen, setMobileOpen] = useState(false)
+  const [isMobile, setIsMobile] = useState(() => typeof window !== 'undefined' && window.matchMedia('(max-width: 799px)').matches)
   const navigate = useNavigate()
-  const isMobile = typeof window !== 'undefined' && window.innerWidth < 800
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const mq = window.matchMedia('(max-width: 799px)')
+    const onChange = (e) => setIsMobile(e.matches)
+    // Safari < 14 still needs addListener
+    if (mq.addEventListener) mq.addEventListener('change', onChange)
+    else mq.addListener(onChange)
+    return () => {
+      if (mq.removeEventListener) mq.removeEventListener('change', onChange)
+      else mq.removeListener(onChange)
+    }
+  }, [])
 
   return (
     <div style={{ display: 'flex', minHeight: '100vh', background: '#0d1117', color: '#e2e8f0', fontFamily: 'Inter,system-ui,sans-serif' }}>

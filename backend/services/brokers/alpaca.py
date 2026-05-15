@@ -22,6 +22,7 @@ class AlpacaAdapter(BrokerAdapter):
         self.api_key = credentials.get("api_key", "")
         self.api_secret = credentials.get("api_secret", "")
         self.base = "https://paper-api.alpaca.markets" if paper_mode else "https://api.alpaca.markets"
+        self._session: "aiohttp.ClientSession | None" = None
 
     def _headers(self):
         return {
@@ -30,20 +31,29 @@ class AlpacaAdapter(BrokerAdapter):
             "Content-Type": "application/json",
         }
 
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=15)
+            self._session = aiohttp.ClientSession(timeout=timeout)
+        return self._session
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+
     async def _request(self, method: str, path: str, **kwargs):
         url = f"{self.base}{path}"
-        timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.request(method, url, headers=self._headers(), **kwargs) as r:
-                text = await r.text()
-                if r.status >= 400:
-                    log.warning(f"alpaca {method} {path} -> {r.status}: {text[:200]}")
-                    raise BrokerError(f"Alpaca {r.status}: {text[:200]}", r.status)
-                try:
-                    import json
-                    return json.loads(text) if text else {}
-                except ValueError:
-                    return {"raw": text}
+        s = await self._get_session()
+        async with s.request(method, url, headers=self._headers(), **kwargs) as r:
+            text = await r.text()
+            if r.status >= 400:
+                log.warning(f"alpaca {method} {path} -> {r.status}: {text[:200]}")
+                raise BrokerError(f"Alpaca {r.status}: {text[:200]}", r.status)
+            try:
+                import json
+                return json.loads(text) if text else {}
+            except ValueError:
+                return {"raw": text}
 
     async def test_connection(self) -> dict:
         try:

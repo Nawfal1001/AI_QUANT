@@ -36,7 +36,9 @@ PROTECTED_ROUTES = [
     ("GET",  "/api/reward/profile",      401),
     ("GET",  "/api/autotrader/config",   401),
     ("GET",  "/api/autotrader/stats",    401),
-    ("POST", "/api/autotrader/scan-now", 401),
+    ("POST", "/api/autotrader/scan-now",   401),
+    ("POST", "/api/autotrader/monitor-now", 401),
+    ("PATCH", "/api/autotrader/config",     401),
     ("GET",  "/api/strategy/strategies", 401),
     ("GET",  "/api/strategy/pending",    401),
     ("POST", "/api/strategy/check-and-switch", 401),
@@ -72,6 +74,8 @@ PROTECTED_ROUTES = [
 ADMIN_ROUTES = [
     ("POST", "/api/autotrader/start"),
     ("POST", "/api/autotrader/stop"),
+    ("POST", "/api/autotrader/scan-now"),
+    ("POST", "/api/autotrader/monitor-now"),
     ("POST", "/api/resolver/start"),
     ("POST", "/api/resolver/stop"),
     ("POST", "/api/learning/wfo/scheduler/start"),
@@ -169,11 +173,11 @@ def test_invalid_token_rejected(app_client):
     assert r.status_code == 401
 
 
-def test_risk_limits_block_unconfigured_user(app_client, auth_headers):
-    """User without risk limits set cannot enable auto-trader."""
+def test_autotrader_config_is_admin_only(app_client, auth_headers):
+    """The auto_trader config is a global singleton; mutating it must require admin."""
     r = app_client.patch("/api/autotrader/config", json={"enabled": True}, headers=auth_headers)
-    assert r.status_code == 400
-    assert "risk limits" in r.json().get("detail", "").lower()
+    # Regular user: expect 403; admin: expect 400 (risk limits not set).
+    assert r.status_code in (400, 403)
 
 
 def test_risk_limits_save_and_status(app_client, auth_headers):

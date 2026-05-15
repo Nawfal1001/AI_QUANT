@@ -20,6 +20,7 @@ class OandaAdapter(BrokerAdapter):
         self.api_key = credentials.get("api_key", "")
         self.account_id = credentials.get("account_id", "")
         self.base = "https://api-fxpractice.oanda.com" if paper_mode else "https://api-fxtrade.oanda.com"
+        self._session: "aiohttp.ClientSession | None" = None
 
     def _headers(self):
         return {
@@ -27,20 +28,29 @@ class OandaAdapter(BrokerAdapter):
             "Content-Type": "application/json",
         }
 
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=15)
+            self._session = aiohttp.ClientSession(timeout=timeout)
+        return self._session
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+
     async def _request(self, method, path, **kwargs):
         url = f"{self.base}{path}"
-        timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.request(method, url, headers=self._headers(), **kwargs) as r:
-                text = await r.text()
-                if r.status >= 400:
-                    log.warning(f"oanda {method} {path} -> {r.status}: {text[:200]}")
-                    raise BrokerError(f"OANDA {r.status}: {text[:200]}", r.status)
-                try:
-                    import json
-                    return json.loads(text) if text else {}
-                except ValueError:
-                    return {}
+        s = await self._get_session()
+        async with s.request(method, url, headers=self._headers(), **kwargs) as r:
+            text = await r.text()
+            if r.status >= 400:
+                log.warning(f"oanda {method} {path} -> {r.status}: {text[:200]}")
+                raise BrokerError(f"OANDA {r.status}: {text[:200]}", r.status)
+            try:
+                import json
+                return json.loads(text) if text else {}
+            except ValueError:
+                return {}
 
     async def test_connection(self):
         try:
@@ -96,19 +106,28 @@ class OandaAdapter(BrokerAdapter):
             for p in data.get("positions", []):
                 long_units = float(p.get("long", {}).get("units", 0))
                 short_units = float(p.get("short", {}).get("units", 0))
-                net = long_units + short_units
-                if abs(net) < 1e-9:
-                    continue
                 long_avg = float(p.get("long", {}).get("averagePrice") or 0)
                 short_avg = float(p.get("short", {}).get("averagePrice") or 0)
-                avg = long_avg if long_units > 0 else short_avg
-                out.append({
-                    "ticker": p.get("instrument"),
-                    "qty": net,
-                    "avg_entry": avg,
-                    "market_value": float(p.get("marginUsed", 0)),
-                    "unrealized_pnl": float(p.get("unrealizedPL", 0)),
-                })
+                # OANDA can be hedged (simultaneous long+short). Emit one entry per leg
+                # so consumers don't see a netted-out misleading row.
+                if abs(long_units) >= 1e-9:
+                    out.append({
+                        "ticker": p.get("instrument"),
+                        "qty": long_units,
+                        "avg_entry": long_avg,
+                        "market_value": float(p.get("long", {}).get("unrealizedPL", 0)),
+                        "unrealized_pnl": float(p.get("long", {}).get("unrealizedPL", 0)),
+                        "side": "long",
+                    })
+                if abs(short_units) >= 1e-9:
+                    out.append({
+                        "ticker": p.get("instrument"),
+                        "qty": short_units,
+                        "avg_entry": short_avg,
+                        "market_value": float(p.get("short", {}).get("unrealizedPL", 0)),
+                        "unrealized_pnl": float(p.get("short", {}).get("unrealizedPL", 0)),
+                        "side": "short",
+                    })
             return out
         except BrokerError as e:
             log.warning(f"get_positions failed: {e}")

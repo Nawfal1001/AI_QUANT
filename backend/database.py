@@ -2,7 +2,12 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
 import os
 load_dotenv()
-MONGO_URL = os.getenv("MONGO_URL","mongodb+srv://nawfal1001:Nawfal1001%21@cluster0.1els7ds.mongodb.net/?appName=Cluster0")
+MONGO_URL = os.getenv("MONGO_URL", "")
+if not MONGO_URL:
+    raise RuntimeError(
+        "MONGO_URL not configured. Set it in environment or .env. "
+        "Never commit DB credentials to source."
+    )
 DB_NAME   = os.getenv("DB_NAME","tradeai_db")
 client = AsyncIOMotorClient(MONGO_URL)
 db     = client[DB_NAME]
@@ -13,5 +18,5 @@ async def create_indexes():
     await db["signals_log"].create_index("outcome")
     await db["open_trades"].create_index("status")
     await db["trade_history"].create_index("closed_at")
-    await db["portfolio"].create_index("ticker",unique=True)
+    await db["portfolio"].create_index([("user_id", 1), ("ticker", 1)], unique=True)
     print("[DB] Indexes OK")

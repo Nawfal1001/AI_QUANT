@@ -5,15 +5,17 @@ Order placement flow:
 - POST /broker/order -> order_router.submit_order
 - That goes through risk + idempotency + live-mode gate + adapter
 """
-import base64
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
+from typing import Optional
 
 from database import db
 from middleware.auth import get_current_user
 from services.brokers import make_adapter, BrokerError
 from services.order_router import submit_order, list_live_orders, cancel_live_order, sync_broker_positions
+from services.credential_crypto import encrypt as _encrypt, decrypt as _decrypt
 from services.logger import child
 
 log = child("broker_router")
@@ -22,16 +24,11 @@ col = db["brokers"]
 
 
 def _obscure(s: str) -> str:
-    return base64.b64encode(s.encode()).decode() if s else ""
+    return _encrypt(s) if s else ""
 
 
 def _reveal(s: str) -> str:
-    if not s:
-        return ""
-    try:
-        return base64.b64decode(s.encode()).decode()
-    except Exception:
-        return ""
+    return _decrypt(s) if s else ""
 
 
 def _mask(s: str) -> str:
@@ -65,8 +62,10 @@ async def connect(data: dict, user=Depends(get_current_user)):
     creds_obscured = {}
     for f in spec["fields"]:
         v = data.get(f, "")
-        if not v:
+        if not isinstance(v, str) or not v.strip():
             raise HTTPException(400, f"Missing field: {f}")
+        if len(v) > 512:
+            raise HTTPException(400, f"Field too long: {f}")
         creds_plain[f] = v
         creds_obscured[f] = _obscure(v)
 
@@ -77,10 +76,11 @@ async def connect(data: dict, user=Depends(get_current_user)):
         adapter = make_adapter(broker, creds_plain, paper_mode=paper_mode)
         test = await adapter.test_connection()
     except BrokerError as e:
-        test = {"status": "test_failed", "message": str(e)}
+        log.warning(f"broker connect test failed: {e}")
+        test = {"status": "test_failed", "message": "Broker rejected credentials"}
     except Exception as e:
         log.exception(f"connect test failed: {e}")
-        test = {"status": "test_failed", "message": str(e)}
+        test = {"status": "test_failed", "message": "Connection test failed"}
 
     doc = {
         "user_id": user["id"],
@@ -125,32 +125,40 @@ async def disconnect(broker: str, user=Depends(get_current_user)):
     return {"deleted": res.deleted_count, "broker": broker}
 
 
-@router.post("/order")
-async def order(data: dict, user=Depends(get_current_user)):
-    """Place a real broker order. Goes through risk + idempotency + adapter."""
-    broker = data.get("broker", "alpaca")
-    ticker = data.get("ticker", "").upper()
-    side = data.get("side", "buy")
-    qty = float(data.get("qty", 0))
-    order_type = data.get("order_type", "market")
-    limit_price = data.get("limit_price")
-    confirm_live = bool(data.get("confirm_live", False))
+import re
+TICKER_RE = re.compile(r"^[A-Z0-9._\-/]{1,20}$")
 
-    if not ticker or qty <= 0:
-        raise HTTPException(400, "ticker and qty>0 required")
+
+class BrokerOrderIn(BaseModel):
+    broker: str = Field("alpaca", max_length=24)
+    ticker: str = Field(..., min_length=1, max_length=20)
+    side: str = Field("buy", pattern=r"^(?i)(buy|sell)$")
+    qty: float = Field(..., gt=0, le=1_000_000_000)
+    order_type: str = Field("market", pattern=r"^(market|limit|stop)$")
+    limit_price: Optional[float] = Field(None, gt=0, le=1_000_000_000)
+    confirm_live: bool = False
+
+
+@router.post("/order")
+async def order(payload: BrokerOrderIn, user=Depends(get_current_user)):
+    """Place a real broker order. Goes through risk + idempotency + adapter."""
+    ticker = payload.ticker.upper().strip()
+    if not TICKER_RE.match(ticker):
+        raise HTTPException(400, "Invalid ticker format")
+    if payload.broker not in [b["id"] for b in BROKER_SPECS]:
+        raise HTTPException(400, f"Unsupported broker: {payload.broker}")
 
     result = await submit_order(
         user_id=user["id"],
-        broker_id=broker,
+        broker_id=payload.broker,
         ticker=ticker,
-        side=side,
-        qty=qty,
-        order_type=order_type,
-        limit_price=limit_price,
-        confirm_live=confirm_live,
+        side=payload.side.lower(),
+        qty=payload.qty,
+        order_type=payload.order_type,
+        limit_price=payload.limit_price,
+        confirm_live=payload.confirm_live,
     )
     if result.get("status") == "rejected":
-        # 400 so the frontend treats it as a user error, not server error
         raise HTTPException(400, result.get("reason") or result.get("message") or "Order rejected")
     return result
 
@@ -181,8 +189,8 @@ async def balance(broker: str, user=Depends(get_current_user)):
     try:
         adapter = make_adapter(broker, creds, paper_mode=doc.get("paper_mode", True))
         bal = await adapter.get_balance()
-        # Update cached value
         await col.update_one({"_id": doc["_id"]}, {"$set": {"balance": bal}})
         return {"broker": broker, "balance": bal}
     except BrokerError as e:
-        raise HTTPException(400, str(e))
+        log.warning(f"broker balance fetch failed: {e}")
+        raise HTTPException(400, "Failed to fetch balance from broker")

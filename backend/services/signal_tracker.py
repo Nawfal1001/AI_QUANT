@@ -51,19 +51,25 @@ async def log_signal(
     return str(r.inserted_id)
 
 
-async def resolve_signal(signal_id: str, outcome: str, pnl_pct: float = 0) -> dict:
+async def resolve_signal(signal_id: str, outcome: str, pnl_pct: float = 0, user_id: Optional[str] = None) -> dict:
     """
     Mark a signal as resolved.
     outcome: 'win' | 'loss' | 'expired'
     Updates aggregate stats by (strategy, symbol, timeframe, regime).
+    If user_id is provided, only signals owned by that user can be resolved.
     """
+    if outcome not in ("win", "loss", "expired"):
+        return {"error": "outcome must be win | loss | expired"}
     from bson import ObjectId
     try:
         oid = ObjectId(signal_id)
     except Exception:
         return {"error": "Invalid signal_id"}
 
-    sig = await col_signals.find_one({"_id": oid})
+    query = {"_id": oid}
+    if user_id is not None:
+        query["user_id"] = user_id
+    sig = await col_signals.find_one(query)
     if not sig:
         return {"error": "Signal not found"}
     if sig.get("status") != "pending":

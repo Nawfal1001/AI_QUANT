@@ -54,15 +54,23 @@ async def test_paper_sell_realizes_pnl(patch_db):
 
 
 @pytest.mark.asyncio
-async def test_paper_oversell_rejected(patch_db):
+async def test_paper_sell_can_open_short(patch_db):
+    """Selling more than the held long quantity closes the long and opens a short
+    for the remainder. This lets SELL signals from bot_runner enter trades on
+    instruments the user doesn't already hold."""
     from services import paper_broker
-    uid = "u_over"
+    uid = "u_short"
     await paper_broker.reset_account(uid, 10000)
     await _setup_risk(uid)
 
     await paper_broker.place_order(uid, "AAPL", "buy", 5, "market", current_price=100, skip_freshness=True)
-    res = await paper_broker.place_order(uid, "AAPL", "sell", 100, "market", current_price=100, skip_freshness=True)
-    assert res["status"] == "rejected"
+    # 5 long → after selling 7, position is -2 (short). Unique (qty=7) avoids idempotency.
+    res = await paper_broker.place_order(uid, "AAPL", "sell", 7, "market", current_price=100, skip_freshness=True)
+    assert res["status"] == "filled"
+    positions = await paper_broker.get_positions(uid, live_prices={"AAPL": 100})
+    short = next(p for p in positions["positions"] if p["ticker"] == "AAPL")
+    assert short["qty"] < 0
+    assert short["side"] == "short"
 
 
 @pytest.mark.asyncio

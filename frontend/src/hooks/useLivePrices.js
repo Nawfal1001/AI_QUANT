@@ -16,15 +16,21 @@ function buildWsUrl() {
   return `${base}${sep}token=${encodeURIComponent(token)}`
 }
 
+const MIN_BACKOFF_MS = 1000
+const MAX_BACKOFF_MS = 60_000
+
 export function useLivePrices(tickers = []) {
   const [prices, setPrices] = useState({})
   const [connected, setConnected] = useState(false)
   const [error, setError] = useState(null)
   const wsRef = useRef(null)
   const retryRef = useRef(null)
+  const attemptsRef = useRef(0)
+  const cancelledRef = useRef(false)
   const key = [...tickers].sort().join(',')
 
   const connect = useCallback(() => {
+    if (cancelledRef.current) return
     if (wsRef.current?.readyState === WebSocket.OPEN) return
     const url = buildWsUrl()
     if (!url) {
@@ -36,6 +42,7 @@ export function useLivePrices(tickers = []) {
       wsRef.current = ws
 
       ws.onopen = () => {
+        attemptsRef.current = 0  // reset backoff on successful open
         setConnected(true)
         setError(null)
         if (tickers.length > 0) {
@@ -55,25 +62,29 @@ export function useLivePrices(tickers = []) {
             setError(d.message || 'ws error')
           }
         } catch (err) {
-          // Bad JSON — log and continue
           console.warn('WS bad message', err)
         }
       }
 
       ws.onclose = (event) => {
         setConnected(false)
+        if (cancelledRef.current) return
         // 4401 = auth failed; don't auto-retry
         if (event.code === 4401) {
           setError('auth_failed')
           return
         }
-        // Otherwise reconnect with backoff
-        retryRef.current = setTimeout(connect, 5000)
+        // Exponential backoff: 1s, 2s, 4s, ... capped at 60s.
+        const delay = Math.min(MAX_BACKOFF_MS, MIN_BACKOFF_MS * Math.pow(2, attemptsRef.current))
+        attemptsRef.current += 1
+        retryRef.current = setTimeout(() => {
+          if (!cancelledRef.current) connect()
+        }, delay)
       }
 
       ws.onerror = (e) => {
         console.warn('WS error', e)
-        ws.close()
+        try { ws.close() } catch {}
       }
     } catch (err) {
       console.error('WS connect failed', err)
@@ -82,10 +93,13 @@ export function useLivePrices(tickers = []) {
   }, [key])
 
   useEffect(() => {
+    cancelledRef.current = false
     connect()
     return () => {
-      clearTimeout(retryRef.current)
-      wsRef.current?.close()
+      cancelledRef.current = true
+      if (retryRef.current) clearTimeout(retryRef.current)
+      retryRef.current = null
+      try { wsRef.current?.close() } catch {}
     }
   }, [connect])
 

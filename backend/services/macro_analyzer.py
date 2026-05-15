@@ -312,6 +312,35 @@ def adjust_signal_with_macro(signal: Dict[str, Any], macro_bias: Dict[str, Any],
     return out
 
 
+async def analyze_macro_report(
+    event_name: str,
+    report_text: str,
+    market_reaction: Optional[Dict[str, Any]] = None,
+    use_ai: bool = True,
+) -> Dict[str, Any]:
+    """Analyze a single macro release (CPI, NFP, FOMC, etc.) and return cross-asset bias.
+
+    Treats the report_text as the canonical headline pool, optionally enriched with
+    market_reaction context. Reuses analyze_macro_impact so callers get the same
+    asset_bias shape (USD/GOLD/EQUITIES/CRYPTO/OIL).
+    """
+    headlines = [event_name] if event_name else []
+    if report_text:
+        for line in str(report_text).splitlines():
+            line = line.strip()
+            if line:
+                headlines.append(line)
+    if market_reaction:
+        for k, v in market_reaction.items():
+            headlines.append(f"{k}: {v}")
+    macro = await analyze_macro_impact(headlines=headlines, use_ai=use_ai)
+    macro["event_name"] = event_name
+    macro.setdefault("needs_price_confirmation", True)
+    macro.setdefault("time_horizon", "intraday")
+    macro.setdefault("trade_instruction", "Follow asset_bias with price confirmation around the release.")
+    return macro
+
+
 async def macro_adjust_signal(ticker: str, asset_type: str, signal: Dict[str, Any], use_ai: bool = True) -> Dict[str, Any]:
     macro = await analyze_macro_impact(use_ai=use_ai)
     bias = macro_bias_for_symbol(macro, ticker, asset_type)

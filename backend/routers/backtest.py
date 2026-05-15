@@ -19,13 +19,26 @@ async def strategies():
     return {"strategies": list_strategies()}
 
 
+VALID_INTERVALS = {"1d", "4h", "1h", "15m"}
+MAX_BACKTEST_DAYS = 3650  # ~10 years
+
+
 @router.post("/run")
 async def run(req: dict, user=Depends(get_current_user)):
-    ticker = req.get("ticker", "AAPL").upper()
+    ticker = (req.get("ticker") or "AAPL").upper()
     asset_type = req.get("asset_type", "stock")
-    capital = float(req.get("capital", 10000))
-    days = int(req.get("days", 365))
+    try:
+        capital = float(req.get("capital", 10000))
+        days = int(req.get("days", 365))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "capital and days must be numeric")
+    if capital <= 0 or capital > 1e10:
+        raise HTTPException(400, "capital out of range")
+    if days <= 0 or days > MAX_BACKTEST_DAYS:
+        raise HTTPException(400, f"days must be 1..{MAX_BACKTEST_DAYS}")
     interval = req.get("interval", "1d")
+    if interval not in VALID_INTERVALS:
+        raise HTTPException(400, f"interval must be one of {sorted(VALID_INTERVALS)}")
     strategy = req.get("strategy", "ensemble")
     user_strategy_id = req.get("user_strategy_id")
 
@@ -78,12 +91,22 @@ async def run(req: dict, user=Depends(get_current_user)):
 @router.post("/compare")
 async def compare(req: dict, user=Depends(get_current_user)):
     """Compare multiple strategies on the same period."""
-    ticker = req.get("ticker", "AAPL").upper()
+    ticker = (req.get("ticker") or "AAPL").upper()
     asset_type = req.get("asset_type", "stock")
-    capital = float(req.get("capital", 10000))
-    days = int(req.get("days", 365))
+    try:
+        capital = float(req.get("capital", 10000))
+        days = int(req.get("days", 365))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "capital and days must be numeric")
+    if capital <= 0 or capital > 1e10 or days <= 0 or days > MAX_BACKTEST_DAYS:
+        raise HTTPException(400, "capital/days out of range")
     interval = req.get("interval", "1d")
-    strategies_to_run = req.get("strategies") or ["trend_follow", "mean_revert", "breakout", "ensemble"]
+    if interval not in VALID_INTERVALS:
+        raise HTTPException(400, f"interval must be one of {sorted(VALID_INTERVALS)}")
+    raw_strategies = req.get("strategies") or ["trend_follow", "mean_revert", "breakout", "ensemble"]
+    if not isinstance(raw_strategies, list) or len(raw_strategies) > 20:
+        raise HTTPException(400, "strategies must be a list of <= 20 names")
+    strategies_to_run = raw_strategies
 
     end = datetime.now().strftime("%Y-%m-%d")
     start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
