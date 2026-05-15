@@ -27,6 +27,19 @@ async def schedules(user=Depends(get_current_user)):
     return {"schedules": list(bot_service.SCHEDULES.keys()), "sizing_modes": bot_service.SIZING_MODES}
 
 
+# Admin-only — controls the global runner thread.
+# Keep these static routes before /{bot_id}; otherwise FastAPI treats
+# "runner" as a bot_id and the start/stop endpoints become unreachable.
+@router.post("/runner/start")
+async def runner_start(user=Depends(require_admin)):
+    return await bot_runner.start_runner()
+
+
+@router.post("/runner/stop")
+async def runner_stop(user=Depends(require_admin)):
+    return await bot_runner.stop_runner()
+
+
 @router.get("/{bot_id}")
 async def get_one(bot_id: str, user=Depends(get_current_user)):
     doc = await bot_service.get_bot(user["id"], bot_id)
@@ -78,14 +91,3 @@ async def executions(bot_id: str, limit: int = 50, user=Depends(get_current_user
     if not bot:
         raise HTTPException(404, "Bot not found")
     return {"executions": await bot_service.get_executions(user["id"], bot_id, limit)}
-
-
-# Admin-only — controls the global runner thread
-@router.post("/runner/start")
-async def runner_start(user=Depends(require_admin)):
-    return await bot_runner.start_runner()
-
-
-@router.post("/runner/stop")
-async def runner_stop(user=Depends(require_admin)):
-    return await bot_runner.stop_runner()
