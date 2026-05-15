@@ -9,7 +9,7 @@ Ranks a broker-compatible universe of symbols for watchlist updates using:
 - optional Gemini AI sentiment
 
 Supports broker-aware universes so bots do not receive symbols their broker
-cannot trade. Crypto discovery uses Binance USDT spot markets.
+cannot trade. Crypto discovery uses CCXT-supported exchanges when available.
 """
 from __future__ import annotations
 
@@ -32,14 +32,61 @@ col_scan_cache = db["symbol_scan_cache"]
 DEFAULT_CRYPTO_UNIVERSE = ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "AVAX", "LINK", "DOT", "TRX", "MATIC", "LTC", "BCH", "ATOM", "NEAR", "APT", "ARB", "OP", "INJ"]
 DEFAULT_STOCK_UNIVERSE = ["AAPL", "MSFT", "NVDA", "TSLA", "META", "AMZN", "GOOGL", "AMD", "NFLX", "COIN"]
 DEFAULT_FOREX_UNIVERSE = ["EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "AUD_USD", "USD_CAD", "NZD_USD", "EUR_GBP", "EUR_JPY", "GBP_JPY"]
+DEFAULT_FUTURES_UNIVERSE = ["ES", "NQ", "YM", "RTY", "CL", "GC", "SI", "NG", "ZB", "ZN"]
+
+BROKER_ALIASES = {
+    "ib": "interactive_brokers",
+    "ibkr": "interactive_brokers",
+    "interactivebroker": "interactive_brokers",
+    "interactive_broker": "interactive_brokers",
+    "interactive_brokers": "interactive_brokers",
+    "interactive brokers": "interactive_brokers",
+    "td": "schwab",
+    "td_ameritrade": "schwab",
+    "charles_schwab": "schwab",
+    "tradestation": "tradestation",
+    "trade_station": "tradestation",
+}
 
 BROKER_DEFAULT_ASSET_TYPE = {
     "binance": "crypto",
+    "binanceus": "crypto",
     "kucoin": "crypto",
     "coinbase": "crypto",
+    "kraken": "crypto",
+    "bybit": "crypto",
+    "okx": "crypto",
+    "bitget": "crypto",
+    "bitstamp": "crypto",
+    "gateio": "crypto",
     "alpaca": "stock",
+    "interactive_brokers": "stock",
+    "ibkr": "stock",
+    "schwab": "stock",
+    "tradestation": "stock",
+    "tastytrade": "stock",
+    "robinhood": "stock",
+    "webull": "stock",
+    "fidelity": "stock",
+    "etrade": "stock",
     "oanda": "forex",
+    "fxcm": "forex",
+    "forexcom": "forex",
     "paper": "crypto",
+}
+
+CCXT_EXCHANGE_BY_BROKER = {
+    "binance": "binance",
+    "binanceus": "binanceus",
+    "kucoin": "kucoin",
+    "coinbase": "coinbase",
+    "kraken": "kraken",
+    "bybit": "bybit",
+    "okx": "okx",
+    "bitget": "bitget",
+    "bitstamp": "bitstamp",
+    "gateio": "gateio",
+    "paper": "binance",
 }
 
 POSITIVE_WORDS = ["surge", "gain", "bull", "beat", "rise", "growth", "profit", "strong", "up", "record", "upgrade", "rally", "breakout"]
@@ -62,7 +109,8 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
 
 
 def normalize_broker_id(broker_id: Optional[str]) -> str:
-    return (broker_id or "paper").lower().strip()
+    raw = (broker_id or "paper").lower().strip().replace("-", "_")
+    return BROKER_ALIASES.get(raw, raw)
 
 
 def infer_asset_type_for_broker(broker_id: Optional[str], asset_type: Optional[str] = None) -> str:
@@ -86,7 +134,6 @@ async def discover_crypto_universe(exchange_id: str = "binance", limit: int = 12
         ts = datetime.fromisoformat(cached.get("updated_at"))
         if datetime.utcnow() - ts < timedelta(hours=6):
             return cached.get("symbols", DEFAULT_CRYPTO_UNIVERSE)
-
     def _fetch_symbols():
         import ccxt
         ex_cls = getattr(ccxt, exchange_id, ccxt.binance)
@@ -97,7 +144,7 @@ async def discover_crypto_universe(exchange_id: str = "binance", limit: int = 12
         for symbol, market in markets.items():
             if not market.get("spot") or not market.get("active"):
                 continue
-            if market.get("quote") != "USDT":
+            if market.get("quote") not in {"USDT", "USD"}:
                 continue
             base = market.get("base", "").upper()
             if not _is_tradable_base(base):
@@ -114,14 +161,12 @@ async def discover_crypto_universe(exchange_id: str = "binance", limit: int = 12
             if len(out) >= limit:
                 break
         return out or DEFAULT_CRYPTO_UNIVERSE
-
     try:
         loop = asyncio.get_event_loop()
         symbols = await loop.run_in_executor(None, _fetch_symbols)
     except Exception as e:
         log.warning(f"crypto universe discovery failed for {exchange_id}: {e}")
         symbols = DEFAULT_CRYPTO_UNIVERSE
-
     await col_scan_cache.replace_one({"kind": "crypto_universe", "exchange": exchange_id}, {"kind": "crypto_universe", "exchange": exchange_id, "symbols": symbols, "updated_at": datetime.utcnow().isoformat()}, upsert=True)
     return symbols
 
@@ -131,14 +176,16 @@ async def resolve_universe(universe: Optional[List[str]], asset_type: str, disco
         return [s.upper().strip() for s in universe if s and isinstance(s, str)]
     broker = normalize_broker_id(broker_id)
     if asset_type == "crypto":
-        if discover and broker in {"binance", "kucoin", "coinbase", "paper"}:
-            exchange = "binance" if broker == "paper" else broker
+        exchange = CCXT_EXCHANGE_BY_BROKER.get(broker)
+        if discover and exchange:
             return await discover_crypto_universe(exchange_id=exchange)
         return DEFAULT_CRYPTO_UNIVERSE
     if asset_type == "stock":
         return DEFAULT_STOCK_UNIVERSE
     if asset_type == "forex":
         return DEFAULT_FOREX_UNIVERSE
+    if asset_type == "future":
+        return DEFAULT_FUTURES_UNIVERSE
     return DEFAULT_CRYPTO_UNIVERSE
 
 
