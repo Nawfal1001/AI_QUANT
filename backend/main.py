@@ -1,13 +1,11 @@
 """
 TradeAI Platform — main FastAPI app.
 
-v5.0 — Production hardening:
-- User scoping on all data routes
-- Risk engine + kill switch
-- Real paper broker with fees/slippage/PnL
-- Multi-strategy backtest
-- Signal performance tracking
-- Structured logging (no more except: pass)
+v6.1 — Connected macro/emergency system:
+- Normal bot runner with high-impact news guard
+- Economic event scheduler
+- Emergency macro runner
+- Macro API routes for frontend monitoring/control
 """
 import asyncio
 import os
@@ -20,13 +18,12 @@ from services.logger import log
 from routers import (
     auth, market, signals, portfolio, alerts, ai_research, backtest, reward,
     sentiment, auto_trader, strategy, quant, resolver, broker, learning, advanced,
-    risk, paper, signal_perf, strategy_lab, bots as bots_router,
+    risk, paper, signal_perf, strategy_lab, bots as bots_router, macro,
 )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # JWT secret check
     secret = os.getenv("JWT_SECRET", "")
     if not secret or secret in ("tradeai_secret_change_me", "change_me", "secret") or len(secret) < 32:
         log.error("=" * 70)
@@ -83,7 +80,20 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.exception(f"Hyper tuner init failed: {e}")
 
-    # v6.0 — Bot runner
+    try:
+        from services.economic_event_engine import start_economic_event_scheduler
+        await start_economic_event_scheduler(interval_sec=int(os.getenv("ECONOMIC_EVENT_SCAN_INTERVAL_SEC", "30")))
+        log.info("Economic event scheduler started")
+    except Exception as e:
+        log.exception(f"Economic event scheduler init failed: {e}")
+
+    try:
+        from services.emergency_macro_runner import start_emergency_macro_runner
+        await start_emergency_macro_runner()
+        log.info("Emergency macro runner started")
+    except Exception as e:
+        log.exception(f"Emergency macro runner init failed: {e}")
+
     try:
         from services.bot_runner import start_runner
         await start_runner()
@@ -93,12 +103,12 @@ async def lifespan(app: FastAPI):
 
     from websocket_manager import broadcast_loop
     task = asyncio.create_task(broadcast_loop())
-    log.info("TradeAI v5.0 ready 🚀 (production hardening enabled)")
+    log.info("TradeAI v6.1 ready 🚀 (macro emergency system connected)")
     yield
     task.cancel()
 
 
-app = FastAPI(title="TradeAI Platform API", version="5.0.0", lifespan=lifespan)
+app = FastAPI(title="TradeAI Platform API", version="6.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
@@ -107,12 +117,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Public routes (no auth required)
 app.include_router(auth.router,        prefix="/api/auth",        tags=["Auth"])
 app.include_router(market.router,      prefix="/api/market",      tags=["Market"])
 app.include_router(sentiment.router,   prefix="/api/sentiment",   tags=["Sentiment"])
-
-# User-scoped routes (auth required, data filtered by user_id)
 app.include_router(signals.router,     prefix="/api/signals",     tags=["Signals"])
 app.include_router(portfolio.router,   prefix="/api/portfolio",   tags=["Portfolio"])
 app.include_router(alerts.router,      prefix="/api/alerts",      tags=["Alerts"])
@@ -126,24 +133,17 @@ app.include_router(resolver.router,    prefix="/api/resolver",    tags=["Resolve
 app.include_router(broker.router,      prefix="/api/broker",      tags=["Broker"])
 app.include_router(learning.router,    prefix="/api/learning",    tags=["Learning"])
 app.include_router(advanced.router,    prefix="/api/advanced",    tags=["Advanced"])
-
-# v5.0 — new routers
 app.include_router(risk.router,        prefix="/api/risk",        tags=["Risk"])
 app.include_router(paper.router,       prefix="/api/paper",       tags=["Paper Trading"])
 app.include_router(signal_perf.router, prefix="/api/signal-perf", tags=["Signal Performance"])
-
-# v5.3 — Strategy Lab
 app.include_router(strategy_lab.router, prefix="/api/strategy-lab", tags=["Strategy Lab"])
-
-# v6.0 — Autonomous bots
 app.include_router(bots_router.router, prefix="/api/bots", tags=["Bots"])
-
+app.include_router(macro.router, prefix="/api/macro", tags=["Macro"])
 
 from websocket_manager import manager
 
 
 async def _ws_authenticate(websocket: WebSocket) -> str:
-    """Validate JWT passed as ?token=... on WebSocket connection. Returns user_id or None."""
     import jwt as _jwt
     token = websocket.query_params.get("token")
     if not token:
@@ -162,7 +162,6 @@ async def _ws_authenticate(websocket: WebSocket) -> str:
 
 @app.websocket("/ws/prices")
 async def ws(websocket: WebSocket):
-    """WebSocket for live prices. Requires ?token=<jwt> in URL."""
     await websocket.accept()
     user_id = await _ws_authenticate(websocket)
     if not user_id:
@@ -187,15 +186,16 @@ async def ws(websocket: WebSocket):
 @app.get("/")
 def root():
     return {
-        "status": "TradeAI Platform v5.0 🚀",
+        "status": "TradeAI Platform v6.1 🚀",
         "docs": "/docs",
         "self_learning": True,
         "production_hardening": True,
+        "macro_emergency_system": True,
         "features": [
             "user-scoping", "risk-engine", "kill-switch", "paper-broker-v2",
             "multi-strategy-backtest", "signal-performance-tracking",
-            "meta-learner", "rl-agent", "confluence-memory", "wfo-optimizer",
-            "hyper-tuner", "defensive-mode", "volume-profile", "microstructure",
-            "llm-sentiment", "outcome-attribution",
+            "adaptive-strategy-selector", "dynamic-watchlists", "broker-aware-scanner",
+            "macro-report-analysis", "economic-event-engine", "news-guard",
+            "emergency-macro-runner", "shared-cache", "websocket-prices",
         ],
     }
