@@ -1,7 +1,7 @@
 """
 Auth service: register / login / refresh / user lookup.
-- Reads JWT_SECRET from env (validated by middleware)
-- Logs all auth events
+- Reads JWT_SECRET from env dynamically.
+- Logs all auth events.
 """
 import os
 from datetime import datetime, timedelta
@@ -15,10 +15,13 @@ from services.logger import child
 log = child("auth")
 users = db["users"]
 
-JWT_SECRET = os.getenv("JWT_SECRET", "")
 JWT_ALGO = "HS256"
 ACCESS_TTL_MIN = int(os.getenv("ACCESS_TTL_MIN", str(60 * 24)))      # 1 day
 REFRESH_TTL_MIN = int(os.getenv("REFRESH_TTL_MIN", str(60 * 24 * 30)))  # 30 days
+
+
+def _jwt_secret() -> str:
+    return os.getenv("JWT_SECRET", "")
 
 
 def hash_pw(p: str) -> str:
@@ -34,11 +37,12 @@ def verify_pw(p: str, h: str) -> bool:
 
 
 def make_token(uid: str, kind: str = "access") -> str:
-    if not JWT_SECRET or len(JWT_SECRET) < 32:
+    secret = _jwt_secret()
+    if not secret or len(secret) < 32:
         raise RuntimeError("JWT_SECRET not configured. Set it in .env (32+ random chars).")
     ttl = ACCESS_TTL_MIN if kind == "access" else REFRESH_TTL_MIN
     payload = {"sub": uid, "type": kind, "exp": datetime.utcnow() + timedelta(minutes=ttl)}
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+    return jwt.encode(payload, secret, algorithm=JWT_ALGO)
 
 
 async def register(email: str, password: str, username: str):
@@ -55,7 +59,6 @@ async def register(email: str, password: str, username: str):
     if await users.find_one({"username": username_s}):
         return {"error": "Username taken"}
 
-    # Whoever registers first becomes admin. Useful for self-hosted single-user installs.
     first_user = (await users.count_documents({})) == 0
     role = "admin" if first_user else "user"
 
@@ -100,10 +103,11 @@ async def login(email: str, password: str):
 
 
 async def refresh(token: str):
-    if not JWT_SECRET or len(JWT_SECRET) < 32:
+    secret = _jwt_secret()
+    if not secret or len(secret) < 32:
         return {"error": "Server misconfigured"}
     try:
-        p = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+        p = jwt.decode(token, secret, algorithms=[JWT_ALGO])
         if p.get("type") != "refresh":
             return {"error": "Wrong token type"}
         return {"access_token": make_token(p["sub"])}
