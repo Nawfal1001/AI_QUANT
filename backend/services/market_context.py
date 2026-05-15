@@ -1,14 +1,18 @@
 """Automatic market-context scoring for confidence calibration.
 
-Adds cross-timeframe, correlation, and crypto derivatives context without
-changing base strategy signals. Designed to be consumed by signals/bots as a
-confidence adjustment layer.
+Adds cross-timeframe, correlation, and crypto derivatives context. Gemini can
+optionally turn those features into a bounded, structured confidence adjustment.
+If Gemini is unavailable, deterministic scoring is used.
 """
 import asyncio
+import json
+import os
+import re
 from functools import partial
-from typing import Dict, List
+from typing import Dict
 
 import ccxt
+import google.generativeai as genai
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -42,7 +46,6 @@ def _signal_from_df(df: pd.DataFrame) -> Dict:
     ema50_prev = _ema(closes[-100:-20], 50) if len(closes) >= 100 else ema50
     vol_avg = float(np.mean(volumes[-20:])) if len(volumes) >= 20 else max(float(volumes[-1]), 1)
     vol_ratio = float(volumes[-1]) / max(vol_avg, 1e-9)
-
     score = 0
     if close > ema20 > ema50:
         score += 1
@@ -54,12 +57,8 @@ def _signal_from_df(df: pd.DataFrame) -> Dict:
         score -= 1
     if vol_ratio >= 1.2:
         score += 1 if score > 0 else -1 if score < 0 else 0
-
-    if score >= 2:
-        return {"direction": "bullish", "score": score, "close": close, "ema20": ema20, "ema50": ema50, "vol_ratio": round(vol_ratio, 3)}
-    if score <= -2:
-        return {"direction": "bearish", "score": score, "close": close, "ema20": ema20, "ema50": ema50, "vol_ratio": round(vol_ratio, 3)}
-    return {"direction": "neutral", "score": score, "close": close, "ema20": ema20, "ema50": ema50, "vol_ratio": round(vol_ratio, 3)}
+    direction = "bullish" if score >= 2 else "bearish" if score <= -2 else "neutral"
+    return {"direction": direction, "score": score, "close": close, "ema20": ema20, "ema50": ema50, "vol_ratio": round(vol_ratio, 3)}
 
 
 def _crypto_ohlcv(symbol: str, timeframe: str, limit: int = 120) -> pd.DataFrame:
@@ -87,18 +86,12 @@ def _multi_timeframe(symbol: str, asset_type: str) -> Dict:
     analysis = {tf: _signal_from_df(df) for tf, df in frames.items()}
     bull = sum(1 for v in analysis.values() if v["direction"] == "bullish")
     bear = sum(1 for v in analysis.values() if v["direction"] == "bearish")
-    if bull >= 2:
-        consensus = "bullish"
-    elif bear >= 2:
-        consensus = "bearish"
-    else:
-        consensus = "mixed"
+    consensus = "bullish" if bull >= 2 else "bearish" if bear >= 2 else "mixed"
     return {"consensus": consensus, "frames": analysis}
 
 
 def _correlation_context(symbol: str, asset_type: str) -> Dict:
     if asset_type == "crypto":
-        ex = ccxt.binance({"enableRateLimit": True})
         target = _crypto_ohlcv(symbol, "1h", 200)["close"].pct_change().dropna()
         benchmarks = [b for b in CRYPTO_BENCHMARKS if b.upper() != symbol.upper()]
         cors = {}
@@ -110,7 +103,6 @@ def _correlation_context(symbol: str, asset_type: str) -> Dict:
             except Exception as e:
                 log.debug(f"correlation failed {symbol}/{b}: {e}")
         return {"benchmarks": cors}
-
     ticker = symbol if asset_type != "forex" else (symbol if "=" in symbol else f"{symbol}=X")
     target_df = _stock_or_forex_history(ticker, "1d", "1y")
     target = target_df["close"].pct_change().dropna() if not target_df.empty else pd.Series(dtype=float)
@@ -133,8 +125,7 @@ def _crypto_derivatives(symbol: str) -> Dict:
     pair = f"{symbol.upper()}/USDT"
     out = {"funding_rate": None, "open_interest": None, "orderbook_imbalance": None}
     try:
-        funding = ex.fetch_funding_rate(pair)
-        out["funding_rate"] = funding.get("fundingRate")
+        out["funding_rate"] = ex.fetch_funding_rate(pair).get("fundingRate")
     except Exception as e:
         log.debug(f"funding unavailable {symbol}: {e}")
     try:
@@ -152,38 +143,72 @@ def _crypto_derivatives(symbol: str) -> Dict:
     return out
 
 
-def _score_context(symbol: str, asset_type: str) -> Dict:
+def _deterministic_adjustment(mtf: Dict, corr: Dict, deriv: Dict, asset_type: str) -> int:
+    adj = 0
+    adj += 8 if mtf["consensus"] in ("bullish", "bearish") else -4
+    if any(abs(v) >= 0.7 for v in corr.get("benchmarks", {}).values()):
+        adj += 3
+    if asset_type == "crypto":
+        imb = deriv.get("orderbook_imbalance")
+        if imb is not None and abs(float(imb)) >= 0.12:
+            adj += 4
+        funding = deriv.get("funding_rate")
+        if funding is not None and abs(float(funding)) > 0.001:
+            adj -= 3
+    return max(-15, min(15, adj))
+
+
+def _ai_adjustment(symbol: str, asset_type: str, features: Dict, fallback: int) -> Dict:
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return {"confidence_adjustment": fallback, "source": "deterministic", "reason": "Gemini unavailable"}
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))
+        prompt = (
+            "You are a trading signal confidence calibration model. "
+            "You must not create a trade signal. Only score the reliability of the existing market context. "
+            "Return JSON only with keys: confidence_adjustment integer -20..20, reliability 0..100, reason short string. "
+            "Use negative adjustment for mixed timeframe, crowded funding, weak volume, conflicting correlation. "
+            f"Symbol: {symbol}, asset_type: {asset_type}. Features JSON: {json.dumps(features, default=str)[:12000]}"
+        )
+        text = model.generate_content(prompt).text or ""
+        match = re.search(r"\{.*\}", text, re.S)
+        if not match:
+            raise ValueError("No JSON returned")
+        parsed = json.loads(match.group())
+        adj = int(parsed.get("confidence_adjustment", fallback))
+        return {
+            "confidence_adjustment": max(-20, min(20, adj)),
+            "source": "gemini",
+            "reliability": max(0, min(100, int(parsed.get("reliability", 50)))),
+            "reason": str(parsed.get("reason", "AI calibrated market context"))[:300],
+        }
+    except Exception as e:
+        log.warning(f"Gemini context calibration failed: {e}")
+        return {"confidence_adjustment": fallback, "source": "deterministic_fallback", "reason": "Gemini failed; used deterministic score"}
+
+
+def _score_context(symbol: str, asset_type: str, use_ai: bool = True) -> Dict:
     mtf = _multi_timeframe(symbol, asset_type)
     corr = _correlation_context(symbol, asset_type)
     deriv = _crypto_derivatives(symbol) if asset_type == "crypto" else {}
-
-    confidence_adjustment = 0
-    if mtf["consensus"] in ("bullish", "bearish"):
-        confidence_adjustment += 8
-    else:
-        confidence_adjustment -= 4
-
-    high_corr = [k for k, v in corr.get("benchmarks", {}).items() if abs(v) >= 0.7]
-    if high_corr:
-        confidence_adjustment += 3
-
-    if asset_type == "crypto":
-        imb = deriv.get("orderbook_imbalance")
-        if imb is not None and abs(imb) >= 0.12:
-            confidence_adjustment += 4
-        funding = deriv.get("funding_rate")
-        if funding is not None and abs(float(funding)) > 0.001:
-            confidence_adjustment -= 3
-
+    deterministic = _deterministic_adjustment(mtf, corr, deriv, asset_type)
+    features = {"multi_timeframe": mtf, "correlation": corr, "derivatives": deriv, "deterministic_adjustment": deterministic}
+    ai = _ai_adjustment(symbol, asset_type, features, deterministic) if use_ai else {"confidence_adjustment": deterministic, "source": "deterministic", "reason": "AI disabled"}
     return {
         "symbol": symbol.upper(),
         "asset_type": asset_type,
-        "confidence_adjustment": max(-15, min(15, confidence_adjustment)),
+        "confidence_adjustment": ai["confidence_adjustment"],
+        "calibration_source": ai.get("source"),
+        "calibration_reason": ai.get("reason"),
+        "ai_reliability": ai.get("reliability"),
+        "deterministic_adjustment": deterministic,
         "multi_timeframe": mtf,
         "correlation": corr,
         "derivatives": deriv,
     }
 
 
-async def market_context(symbol: str, asset_type: str = "crypto") -> Dict:
-    return await asyncio.get_event_loop().run_in_executor(None, partial(_score_context, symbol.upper(), asset_type.lower()))
+async def market_context(symbol: str, asset_type: str = "crypto", use_ai: bool = True) -> Dict:
+    return await asyncio.get_event_loop().run_in_executor(None, partial(_score_context, symbol.upper(), asset_type.lower(), use_ai))
