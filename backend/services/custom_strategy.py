@@ -7,69 +7,51 @@ Security model:
   - arithmetic / comparisons / boolean logic
   - calls to whitelisted helpers (rsi, ema, atr, bb_upper, bb_lower, etc.)
   - access to whitelisted variables (close, open, high, low, volume, prev_close)
-- No function definitions, imports, attribute access, subscripting beyond [-1],
+- No function definitions, imports, attribute access, subscripting beyond integer slices,
   no `eval`, no `exec`, no dunders.
 - Each rule produces a boolean. The strategy is a list of rules with weights.
-
-A user strategy looks like:
-{
-  "name": "My Breakout",
-  "description": "Custom 50-day breakout",
-  "rules": [
-    {"when": "close > max(highs[-50:-1])", "weight": 60, "side": "BUY"},
-    {"when": "volume > avg_volume(20) * 1.3", "weight": 20, "side": "BUY"},
-    {"when": "close < min(lows[-50:-1])", "weight": 60, "side": "SELL"},
-  ],
-  "min_confidence": 60,
-}
-
-Total weighted score per side determines the signal:
-- weight >= 80 → STRONG_BUY/SELL
-- weight >= 50 → BUY/SELL
-- otherwise   → HOLD
 """
 import ast
 from typing import Dict, List
 
 import numpy as np
 
-# Indicator helpers — same primitives as the built-in strategies
 from services.strategies import _ema, _rsi, _atr
 
-
-# =============================================================================
-# AST whitelist
-# =============================================================================
-
-# Operator types allowed in user expressions
 _ALLOWED_NODES = {
     ast.Expression, ast.Module, ast.Expr,
-    # Literals
-    ast.Constant, ast.Num, ast.Str,  # Num/Str for older Pythons
-    # Operators
+    ast.Constant, ast.Num, ast.Str,
     ast.BoolOp, ast.BinOp, ast.UnaryOp, ast.Compare,
     ast.And, ast.Or, ast.Not,
     ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.FloorDiv, ast.Pow,
     ast.UAdd, ast.USub,
     ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Eq, ast.NotEq,
-    # Containers (for max(highs[-20:]))
     ast.List, ast.Tuple,
     ast.Subscript, ast.Slice, ast.Index,
-    # Names and calls
     ast.Name, ast.Load, ast.Call, ast.keyword,
-    # if expression (a if cond else b)
     ast.IfExp,
 }
 
-# Functions the user can call in expressions
 _SAFE_BUILTINS = {
     "min": min, "max": max, "abs": abs, "sum": sum, "len": len, "round": round,
     "True": True, "False": False, "None": None,
 }
 
-# Names the user MAY NOT call or reference, even if syntactically valid.
-# Defence in depth — the empty __builtins__ at eval time would block these anyway,
-# but we reject up front so users get a clear validation error.
+_ALLOWED_VARIABLES = {
+    "close", "open", "high", "low", "volume", "prev_close",
+    "rsi", "macd", "ema12", "ema26", "atr", "atr_pct",
+    "bb_upper", "bb_lower", "bb_mean",
+    "closes", "highs", "lows", "opens", "volumes",
+    "True", "False", "None",
+}
+
+_ALLOWED_FUNCTIONS = {
+    "ema", "avg_volume", "avg_price", "std",
+    "min", "max", "abs", "sum", "len", "round",
+}
+
+_ALLOWED_NAMES = _ALLOWED_VARIABLES | _ALLOWED_FUNCTIONS
+
 _FORBIDDEN_NAMES = {
     "eval", "exec", "compile", "open", "input",
     "globals", "locals", "vars", "dir", "help",
@@ -89,23 +71,23 @@ def _walk_validate(node, path="<root>"):
     if type(node) not in _ALLOWED_NODES:
         raise StrategyError(f"Disallowed syntax: {type(node).__name__} at {path}")
 
-    # Forbid attribute access entirely (no .__class__ shenanigans)
     if isinstance(node, ast.Attribute):
         raise StrategyError(f"Attribute access not allowed at {path}")
 
-    # Forbid dunder names in any identifier
-    if isinstance(node, ast.Name) and node.id.startswith("_"):
-        raise StrategyError(f"Names starting with underscore not allowed: {node.id}")
+    if isinstance(node, ast.Name):
+        if node.id.startswith("_"):
+            raise StrategyError(f"Names starting with underscore not allowed: {node.id}")
+        if node.id in _FORBIDDEN_NAMES:
+            raise StrategyError(f"Use of '{node.id}' is not allowed")
+        if node.id not in _ALLOWED_NAMES:
+            raise StrategyError(f"Unknown name '{node.id}'")
 
-    # Forbid explicitly blocked names — defence in depth on top of empty __builtins__
-    if isinstance(node, ast.Name) and node.id in _FORBIDDEN_NAMES:
-        raise StrategyError(f"Use of '{node.id}' is not allowed")
-
-    # Only allow calls to identified-by-name functions (no f(g)(x) trickery)
     if isinstance(node, ast.Call):
         if not isinstance(node.func, ast.Name):
             raise StrategyError("Only direct function calls by name are allowed")
-        # Subscript slice = only int constants or [-N:] [N:M]
+        if node.func.id not in _ALLOWED_FUNCTIONS:
+            raise StrategyError(f"Function '{node.func.id}' is not allowed")
+
     if isinstance(node, ast.Slice):
         for part in (node.lower, node.upper, node.step):
             if part is None:
@@ -121,10 +103,6 @@ def _walk_validate(node, path="<root>"):
 
 
 def validate_expression(expr: str) -> dict:
-    """
-    Parse + validate a single expression. Returns:
-      {"ok": True} or {"ok": False, "error": str}
-    """
     if not isinstance(expr, str) or not expr.strip():
         return {"ok": False, "error": "Empty expression"}
     if len(expr) > 500:
@@ -141,7 +119,6 @@ def validate_expression(expr: str) -> dict:
 
 
 def validate_strategy(strategy: dict) -> dict:
-    """Validate the full strategy definition."""
     if not isinstance(strategy, dict):
         return {"ok": False, "error": "Strategy must be a JSON object"}
 
@@ -180,12 +157,7 @@ def validate_strategy(strategy: dict) -> dict:
     return {"ok": True}
 
 
-# =============================================================================
-# Evaluation
-# =============================================================================
-
 def _build_context(window) -> dict:
-    """Build the variable + function namespace exposed to a rule expression."""
     closes = window["close"].values
     highs = window["high"].values
     lows = window["low"].values
@@ -199,13 +171,11 @@ def _build_context(window) -> dict:
     volume = float(volumes[-1])
     prev_close = float(closes[-2]) if len(closes) >= 2 else close
 
-    # Bollinger helpers
     bb_mean = float(np.mean(closes[-20:])) if len(closes) >= 20 else close
     bb_std = float(np.std(closes[-20:])) if len(closes) >= 20 else 0
     bb_upper = bb_mean + 2 * bb_std
     bb_lower = bb_mean - 2 * bb_std
 
-    # MACD-ish
     ema12 = _ema(closes[-30:], 12) if len(closes) >= 30 else close
     ema26 = _ema(closes[-50:], 26) if len(closes) >= 50 else close
     macd = ema12 - ema26
@@ -214,7 +184,6 @@ def _build_context(window) -> dict:
     atr_val = _atr(highs, lows, closes)
     atr_pct = atr_val / close * 100 if close else 0
 
-    # Window arrays — bounded so slicing can't ask for huge data
     closes_list = closes[-200:].tolist()
     highs_list = highs[-200:].tolist()
     lows_list = lows[-200:].tolist()
@@ -223,7 +192,8 @@ def _build_context(window) -> dict:
 
     def ema(period: int) -> float:
         period = max(2, min(int(period), 200))
-        return float(_ema(closes[-period * 3:][-period * 3:] if len(closes) >= period * 3 else closes, period))
+        source = closes[-period * 3:] if len(closes) >= period * 3 else closes
+        return float(_ema(source, period))
 
     def avg_volume(period: int) -> float:
         period = max(2, min(int(period), 200))
@@ -242,30 +212,22 @@ def _build_context(window) -> dict:
 
     return {
         **_SAFE_BUILTINS,
-        # Scalars
         "close": close, "open": open_, "high": high, "low": low,
         "volume": volume, "prev_close": prev_close,
         "rsi": rsi_val, "macd": macd, "ema12": ema12, "ema26": ema26,
         "atr": atr_val, "atr_pct": atr_pct,
         "bb_upper": bb_upper, "bb_lower": bb_lower, "bb_mean": bb_mean,
-        # Arrays (for slicing in expressions)
         "closes": closes_list, "highs": highs_list, "lows": lows_list,
         "opens": opens_list, "volumes": volumes_list,
-        # Functions
         "ema": ema, "avg_volume": avg_volume, "avg_price": avg_price, "std": std,
     }
 
 
 def evaluate_rule(expr: str, context: dict) -> bool:
-    """Evaluate a single rule expression. Returns True/False."""
-    # Compile in restricted mode — but eval() is still doing the real work,
-    # so validation must have been done up-front.
     v = validate_expression(expr)
     if not v["ok"]:
         raise StrategyError(v["error"])
     try:
-        # eval(...) is safe here because we've AST-checked the expression
-        # and the namespace contains only whitelisted callables.
         result = eval(expr, {"__builtins__": {}}, context)  # noqa: S307
     except Exception as e:
         raise StrategyError(f"Eval error: {e}")
@@ -273,10 +235,6 @@ def evaluate_rule(expr: str, context: dict) -> bool:
 
 
 def run_custom_strategy(strategy: dict, window) -> dict:
-    """
-    Run a user strategy against a window. Returns the same shape as built-ins:
-    {"signal": str, "confidence": int, "atr_pct": float, "strategy": str}
-    """
     if len(window) < 30:
         return {"signal": "HOLD", "confidence": 0, "atr_pct": 0, "strategy": strategy.get("name", "custom")}
 
@@ -302,6 +260,8 @@ def run_custom_strategy(strategy: dict, window) -> dict:
     name = strategy.get("name", "custom")
     atr_pct = context["atr_pct"]
 
+    if buy_score < min_conf and sell_score < min_conf:
+        return {"signal": "HOLD", "confidence": int(max(buy_score, sell_score)), "atr_pct": atr_pct, "strategy": name, "rules_fired": rules_fired}
     if buy_score >= 80 and buy_score > sell_score:
         return {"signal": "STRONG_BUY", "confidence": min(95, int(buy_score)), "atr_pct": atr_pct, "strategy": name, "rules_fired": rules_fired}
     if buy_score >= 50 and buy_score > sell_score:
@@ -312,10 +272,6 @@ def run_custom_strategy(strategy: dict, window) -> dict:
         return {"signal": "SELL", "confidence": min(80, int(sell_score)), "atr_pct": atr_pct, "strategy": name, "rules_fired": rules_fired}
     return {"signal": "HOLD", "confidence": int(max(buy_score, sell_score)), "atr_pct": atr_pct, "strategy": name, "rules_fired": rules_fired}
 
-
-# =============================================================================
-# Variable reference — what users can use in expressions
-# =============================================================================
 
 REFERENCE = {
     "variables": [
