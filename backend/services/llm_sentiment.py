@@ -61,7 +61,7 @@ async def get_llm_sentiment(ticker, atype="stock", use_cache=True):
         cached = await sent_col.find_one({"_id": cache_key})
         if cached:
             try:
-                age = (datetime.now() - datetime.fromisoformat(cached["timestamp"])).total_seconds()
+                age = (datetime.utcnow() - datetime.fromisoformat(cached["timestamp"])).total_seconds()
                 if age < 1800:
                     cached.pop("_id", None)
                     return {**cached, "cached": True}
@@ -95,7 +95,7 @@ async def get_llm_sentiment(ticker, atype="stock", use_cache=True):
         "headlines": scored,
         "count": len(scored),
         "indicator": "LLM_SENTIMENT",
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": datetime.utcnow().isoformat(),
     }
     await sent_col.replace_one({"_id": cache_key}, {"_id": cache_key, **result}, upsert=True)
     return result

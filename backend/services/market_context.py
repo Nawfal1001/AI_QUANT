@@ -24,6 +24,26 @@ log = child("market_context")
 CRYPTO_BENCHMARKS = ["BTC", "ETH", "BNB", "SOL"]
 FOREX_BENCHMARKS = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "USDCAD=X"]
 
+# Reuse a single ccxt client per process — every new instance loses rate-limit
+# state and adds TLS handshake overhead. The futures client is separate because
+# defaultType=future is sticky on the instance.
+_SPOT_CLIENT = None
+_FUTURES_CLIENT = None
+
+
+def _spot():
+    global _SPOT_CLIENT
+    if _SPOT_CLIENT is None:
+        _SPOT_CLIENT = ccxt.binance({"enableRateLimit": True})
+    return _SPOT_CLIENT
+
+
+def _futures():
+    global _FUTURES_CLIENT
+    if _FUTURES_CLIENT is None:
+        _FUTURES_CLIENT = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "future"}})
+    return _FUTURES_CLIENT
+
 
 def _ema(arr, period):
     if len(arr) == 0:
@@ -62,8 +82,7 @@ def _signal_from_df(df: pd.DataFrame) -> Dict:
 
 
 def _crypto_ohlcv(symbol: str, timeframe: str, limit: int = 120) -> pd.DataFrame:
-    ex = ccxt.binance({"enableRateLimit": True})
-    data = ex.fetch_ohlcv(f"{symbol.upper()}/USDT", timeframe=timeframe, limit=limit)
+    data = _spot().fetch_ohlcv(f"{symbol.upper()}/USDT", timeframe=timeframe, limit=limit)
     return pd.DataFrame(data, columns=["ts", "open", "high", "low", "close", "volume"])
 
 
@@ -121,7 +140,7 @@ def _correlation_context(symbol: str, asset_type: str) -> Dict:
 
 
 def _crypto_derivatives(symbol: str) -> Dict:
-    ex = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "future"}})
+    ex = _futures()
     pair = f"{symbol.upper()}/USDT"
     out = {"funding_rate": None, "open_interest": None, "orderbook_imbalance": None}
     try:

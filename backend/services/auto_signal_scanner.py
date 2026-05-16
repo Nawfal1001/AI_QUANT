@@ -41,24 +41,39 @@ def _csv_env(name: str) -> List[str]:
 
 
 async def _configured_brokers() -> List[str]:
+    """Return brokers worth scanning. Order of preference:
+    1. Explicit AUTO_SIGNAL_BROKERS env (csv) — operator override
+    2. Brokers any user has actually configured creds for (db["brokers"])
+    3. Brokers attached to any bot
+    4. Fall back to {"paper", "fusion"} so the scanner is never empty.
+
+    Previous behaviour was to scan every broker the platform supports plus
+    fusion regardless of configuration — that wasted minutes per cycle on
+    brokers nobody can trade on.
+    """
     explicit = _csv_env("AUTO_SIGNAL_BROKERS")
-    brokers = [normalize_broker_id(x) for x in explicit] if explicit else []
-    brokers.extend([normalize_broker_id(x) for x in BROKER_DEFAULT_ASSET_TYPE.keys()])
-    brokers.append("fusion")
+    if explicit:
+        return [normalize_broker_id(x) for x in explicit if x]
+
+    out: List[str] = []
     try:
-        docs = await db["bots"].distinct("broker")
-        brokers.extend([normalize_broker_id(x) for x in docs if x])
+        for x in await db["brokers"].distinct("broker_id"):
+            nb = normalize_broker_id(x)
+            if nb and nb not in out:
+                out.append(nb)
     except Exception:
         pass
     try:
-        docs = await db["broker_accounts"].distinct("broker")
-        brokers.extend([normalize_broker_id(x) for x in docs if x])
+        for x in await db["bots"].distinct("broker"):
+            nb = normalize_broker_id(x)
+            if nb and nb not in out:
+                out.append(nb)
     except Exception:
         pass
-    out = []
-    for b in brokers:
-        if b and b not in out:
-            out.append(b)
+    if not out:
+        out = ["paper", "fusion"]
+    elif "paper" not in out:
+        out.insert(0, "paper")
     return out
 
 
@@ -119,17 +134,30 @@ async def scan_all_auto_signals() -> Dict[str, Any]:
     scan_limit = int(os.getenv("AUTO_SIGNAL_SCAN_LIMIT", "20"))
     signal_limit = int(os.getenv("AUTO_SIGNAL_LIMIT", "10"))
     min_confidence = float(os.getenv("AUTO_SIGNAL_MIN_CONFIDENCE", "55"))
+    max_parallel = int(os.getenv("AUTO_SIGNAL_MAX_PARALLEL", "4"))
     use_ai = _env_bool("AUTO_SIGNAL_USE_AI", True)
     discover = _env_bool("AUTO_SIGNAL_DISCOVER_UNIVERSE", True)
-    runs = []
-    for broker in brokers:
-        for asset in _asset_types_for_broker(broker):
+
+    # Build the (broker, asset_type) work list, then run them with bounded
+    # concurrency. Was previously sequential — 5 brokers × 3 assets * ~30s/scan
+    # could exceed the 15min scheduler interval and stall.
+    jobs = [(b, a) for b in brokers for a in _asset_types_for_broker(b)]
+    sem = asyncio.Semaphore(max(1, max_parallel))
+
+    async def _one(broker: str, asset: str):
+        async with sem:
             try:
-                runs.append(await scan_auto_signals(broker_id=broker, asset_type=asset, timeframe=timeframe, interval=interval, scan_limit=scan_limit, signal_limit=signal_limit, min_confidence=min_confidence, use_ai=use_ai, discover=discover))
+                return await scan_auto_signals(
+                    broker_id=broker, asset_type=asset, timeframe=timeframe, interval=interval,
+                    scan_limit=scan_limit, signal_limit=signal_limit,
+                    min_confidence=min_confidence, use_ai=use_ai, discover=discover,
+                )
             except Exception as e:
                 log.warning(f"auto signal scan failed for {broker}/{asset}: {e}")
-                runs.append({"broker": broker, "asset_type": asset, "error": str(e), "finished_at": datetime.utcnow().isoformat()})
-    return {"brokers": brokers, "runs": runs, "finished_at": datetime.utcnow().isoformat()}
+                return {"broker": broker, "asset_type": asset, "error": str(e), "finished_at": datetime.utcnow().isoformat()}
+
+    runs = await asyncio.gather(*(_one(b, a) for b, a in jobs))
+    return {"brokers": brokers, "runs": list(runs), "finished_at": datetime.utcnow().isoformat()}
 
 
 async def latest_auto_signals(broker_id: Optional[str] = None, asset_type: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:

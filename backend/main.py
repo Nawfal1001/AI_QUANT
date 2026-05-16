@@ -20,6 +20,7 @@ from routers import (
     sentiment, auto_trader, strategy, quant, resolver, broker, learning, advanced,
     risk, paper, signal_perf, strategy_lab, bots as bots_router, macro,
     runtime_controls as runtime_controls_router, context as context_router,
+    auto_signals as auto_signals_router, calendar as calendar_router,
 )
 
 
@@ -84,6 +85,11 @@ async def lifespan(app: FastAPI):
     try:
         from services.economic_event_engine import start_economic_event_scheduler
         await start_economic_event_scheduler(interval_sec=int(os.getenv("ECONOMIC_EVENT_SCAN_INTERVAL_SEC", "30")))
+        # Auto signal scanner — runs the universe→signals pipeline in the background
+        # so the Dashboard / Auto-Signals page always has fresh actionable picks.
+        from services.auto_signal_scanner import start_auto_signal_scanner
+        await start_auto_signal_scanner()
+        log.info("Auto signal scanner started")
         log.info("Economic event scheduler started")
     except Exception as e:
         log.exception(f"Economic event scheduler init failed: {e}")
@@ -119,6 +125,7 @@ async def lifespan(app: FastAPI):
             "services.bot_runner.stop_runner",
             "services.auto_trader.stop_scheduler",
             "services.signal_resolver.stop_resolver",
+            "services.auto_signal_scanner.stop_auto_signal_scanner",
         ]:
             try:
                 mod_name, fn_name = stopper.rsplit(".", 1)
@@ -199,6 +206,8 @@ app.include_router(bots_router.router, prefix="/api/bots", tags=["Bots"])
 app.include_router(macro.router, prefix="/api/macro", tags=["Macro"])
 app.include_router(runtime_controls_router.router, prefix="/api/runtime-controls", tags=["Runtime Controls"])
 app.include_router(context_router.router, prefix="/api/context", tags=["Market Context"])
+app.include_router(auto_signals_router.router, prefix="/api/auto-signals", tags=["Auto Signals"])
+app.include_router(calendar_router.router, prefix="/api/calendar", tags=["Economic Calendar"])
 
 from websocket_manager import manager
 
