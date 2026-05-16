@@ -21,7 +21,7 @@ from routers import (
     sentiment, auto_trader, strategy, quant, resolver, broker, learning, advanced,
     risk, paper, signal_perf, strategy_lab, bots as bots_router, macro,
     runtime_controls as runtime_controls_router, context as context_router,
-    auto_signals as auto_signals_router,
+    auto_signals as auto_signals_router, calendar as calendar_router,
 )
 
 
@@ -193,6 +193,7 @@ app.include_router(bots_router.router, prefix="/api/bots", tags=["Bots"])
 app.include_router(macro.router, prefix="/api/macro", tags=["Macro"])
 app.include_router(runtime_controls_router.router, prefix="/api/runtime-controls", tags=["Runtime Controls"])
 app.include_router(context_router.router, prefix="/api/context", tags=["Market Context"])
+app.include_router(calendar_router.router, prefix="/api/calendar", tags=["Economic Calendar"])
 
 from websocket_manager import manager
 
