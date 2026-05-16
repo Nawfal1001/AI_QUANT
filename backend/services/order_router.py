@@ -138,9 +138,21 @@ async def cancel_live_order(user_id: str, broker_id: str, broker_order_id: str) 
         adapter, _ = await get_broker_connection(user_id, broker_id)
     except BrokerError as e:
         return {"status": "error", "message": str(e)}
-    result = await adapter.cancel_order(broker_order_id)
+    # Look up the ticker so adapters that need a symbol (e.g. Binance / ccxt) can use it.
+    order_doc = await col_live_orders.find_one({
+        "user_id": user_id, "broker_id": broker_id, "broker_order_id": broker_order_id,
+    })
+    symbol = order_doc.get("ticker") if order_doc else None
+    try:
+        result = await adapter.cancel_order(broker_order_id, symbol=symbol) if symbol else await adapter.cancel_order(broker_order_id)
+    except TypeError:
+        # Adapter doesn't accept the symbol kwarg — fall back to single-arg call.
+        result = await adapter.cancel_order(broker_order_id)
     if result.get("status") == "cancelled":
-        await col_live_orders.update_one({"user_id": user_id, "broker_id": broker_id, "broker_order_id": broker_order_id}, {"$set": {"status": "cancelled", "cancelled_at": datetime.utcnow().isoformat()}})
+        await col_live_orders.update_one(
+            {"user_id": user_id, "broker_id": broker_id, "broker_order_id": broker_order_id},
+            {"$set": {"status": "cancelled", "cancelled_at": datetime.utcnow().isoformat()}},
+        )
     return result
 
 

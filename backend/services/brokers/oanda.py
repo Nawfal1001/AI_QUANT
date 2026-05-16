@@ -137,11 +137,27 @@ class OandaAdapter(BrokerAdapter):
         try:
             data = await self._request("GET", f"/v3/accounts/{self.account_id}/orders/{broker_order_id}")
             order = data.get("order", {})
+            state = (order.get("state") or "unknown").lower()
+            # OANDA reports filled units and price on the fill transaction; for
+            # a FILLED order the response includes filledOrderID + fillingTransactionID.
+            filled_units = order.get("filledUnits") or order.get("units") or 0
+            try:
+                filled_qty = abs(float(filled_units)) if state == "filled" else 0.0
+            except (TypeError, ValueError):
+                filled_qty = 0.0
+            fill_price = None
+            for key in ("price", "averageFillPrice", "fillingPrice"):
+                if order.get(key) is not None:
+                    try:
+                        fill_price = float(order[key])
+                        break
+                    except (TypeError, ValueError):
+                        pass
             return {
                 "broker_order_id": order.get("id"),
-                "status": order.get("state", "unknown").lower(),
-                "filled_qty": 0,
-                "fill_price": None,
+                "status": state,
+                "filled_qty": filled_qty,
+                "fill_price": fill_price,
                 "message": "",
             }
         except BrokerError as e:

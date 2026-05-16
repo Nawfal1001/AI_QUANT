@@ -25,7 +25,9 @@ def _fetch(ticker,atype,period):
         else:
             ohlcv=ccxt.binance().fetch_ohlcv(f"{ticker}/USDT","1d",limit=period)
             df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","volume"]); return df[["open","high","low","close","volume"]].dropna()
-    except: return pd.DataFrame()
+    except Exception as e:
+        _log.warning(f"_fetch failed for {ticker} ({atype}): {e}")
+        return pd.DataFrame()
 
 def rsi(c):
     try:
@@ -150,7 +152,7 @@ async def generate_signal(ticker, atype="stock", timeframe="swing", use_ai=False
     loop=asyncio.get_event_loop()
     df=await loop.run_in_executor(None,partial(_fetch,ticker,atype,cfg["period"]))
     if df.empty or len(df)<50:
-        return {"ticker":ticker,"signal":"HOLD","confidence":0,"error":"Not enough data","timestamp":datetime.now().isoformat()}
+        return {"ticker":ticker,"signal":"HOLD","confidence":0,"error":"Not enough data","timestamp":datetime.utcnow().isoformat()}
     c=df["close"]; h=df["high"]; l=df["low"]; v=df["volume"]; price=float(c.iloc[-1])
     weights=await get_weights()
     hilbert_data=calc_hilbert(c)
@@ -171,7 +173,8 @@ async def generate_signal(ticker, atype="stock", timeframe="swing", use_ai=False
     try:
         bv=await bayesian_vote(inds,regime,ai_score)
         sig=bv["signal"]; conf=bv["confidence"]; pb=bv["p_buy"]
-    except:
+    except Exception as _e:
+        _log.warning(f"bayesian_vote failed for {ticker}: {_e}")
         sig,conf,pb="HOLD",50,0.5
         bv={}
     if not entropy_ok: conf=int(conf*0.5)
@@ -184,10 +187,20 @@ async def generate_signal(ticker, atype="stock", timeframe="swing", use_ai=False
             from services.llm_sentiment import get_llm_sentiment
             llm = await get_llm_sentiment(ticker, atype)
             enhancements["llm_sentiment"] = llm
-            if llm.get("score",0) != 0:
-                conf = max(0, min(100, conf + llm["score"]*4))
-                if llm.get("signal","NEUTRAL") != sig.replace("STRONG ","").replace("WEAK ",""):
-                    # disagreement → reduce confidence
+            llm_score = llm.get("score", 0)
+            if llm_score != 0:
+                # Map LLM directional label to our BUY/SELL vocab. The LLM emits
+                # "BULLISH"/"BEARISH"/"NEUTRAL" but `sig` here is BUY / SELL /
+                # STRONG_BUY / STRONG_SELL / HOLD — the old `sig.replace("STRONG ",...)`
+                # didn't strip the underscore prefix and always reported disagreement.
+                llm_label = str(llm.get("signal", "NEUTRAL")).upper()
+                llm_dir = "BUY" if llm_label in ("BULLISH", "BUY") else "SELL" if llm_label in ("BEARISH", "SELL") else "HOLD"
+                sig_dir = "BUY" if "BUY" in sig else "SELL" if "SELL" in sig else "HOLD"
+                agree = (llm_dir == sig_dir and llm_dir != "HOLD")
+                disagree = (llm_dir != sig_dir and llm_dir != "HOLD" and sig_dir != "HOLD")
+                if agree:
+                    conf = max(0, min(100, conf + abs(llm_score) * 4))
+                elif disagree:
                     conf = max(0, conf - 5)
         except Exception as e: enhancements["llm_sentiment"]={"error":str(e)}
         # 2) Volume Profile
@@ -230,7 +243,7 @@ async def generate_signal(ticker, atype="stock", timeframe="swing", use_ai=False
     result = {"ticker":ticker,"asset_type":atype,"timeframe":timeframe,"signal":sig,"confidence":conf,
               "price":round(price,4),"sl":round(sl,4),"tp":round(tp,4),"atr":round(atr_val,4),
               "regime":regime,"indicators":inds,"bayesian":bv,"enhancements":enhancements,
-              "timestamp":datetime.now().isoformat()}
+              "timestamp":datetime.utcnow().isoformat()}
 
     # 5) Meta Learner prediction (after we have full signal)
     if use_advanced:

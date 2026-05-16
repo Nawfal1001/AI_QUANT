@@ -1,10 +1,21 @@
 """
 TradeAI Auto-Trader v4.3
-Connected to: Quant pipeline + Meta Learner + RL Agent + Defensive Mode + Confluence Memory
-Self-learning via outcome tracking → updates Q-table, weights, meta-model, and bayesian likelihoods.
+
+This service is a *virtual* signal generator + PnL tracker that bootstraps the
+self-learning stack (RL Q-table, weights, meta-model, bayesian likelihoods).
+
+IMPORTANT: it does NOT place real broker orders. The trades it inserts into
+`open_trades` are simulated — monitor_open() closes them when the cached price
+hits SL/TP, then feeds the outcome into the learning systems. For real order
+placement go through:
+  - paper_broker.place_order (user's paper account), or
+  - order_router.submit_order (live broker via configured adapter).
+
+Bots in services/bot_runner.py are the user-facing trading path; this service
+is the learning loop that runs in the background.
 """
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from database import db
 from services.signal_service import generate_signal
 from services.position_sizing import optimal_position

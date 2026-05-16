@@ -76,9 +76,26 @@ class BinanceAdapter(BrokerAdapter):
         except BrokerError as e:
             return {"broker_order_id": None, "status": "rejected", "filled_qty": 0, "fill_price": None, "message": str(e)}
 
-    async def cancel_order(self, broker_order_id):
-        # ccxt requires symbol — would need to look it up. Skip for now.
-        return {"status": "error", "message": "Cancel not implemented for Binance adapter (needs symbol)"}
+    async def cancel_order(self, broker_order_id, symbol: str = None):
+        """Cancel an open order. ccxt's Binance backend needs the symbol so the
+        order_router passes it (looked up from live_orders by broker_order_id).
+        Falls back to scanning open orders if not supplied."""
+        try:
+            pair = self._pair(symbol) if symbol else None
+            if pair is None:
+                # Best-effort: find the order in any open-orders list.
+                opens = await self._run(self.client.fetch_open_orders)
+                match = next((o for o in opens if str(o.get("id")) == str(broker_order_id)), None)
+                if not match:
+                    return {"status": "error", "message": f"Order {broker_order_id} not found among open Binance orders"}
+                pair = match.get("symbol")
+            await self._run(self.client.cancel_order, str(broker_order_id), pair)
+            return {"status": "cancelled", "message": f"Order {broker_order_id} cancelled on {pair}"}
+        except BrokerError as e:
+            return {"status": "error", "message": str(e)}
+        except Exception as e:
+            log.warning(f"binance cancel_order failed: {e}")
+            return {"status": "error", "message": str(e)}
 
     async def get_positions(self):
         try:
