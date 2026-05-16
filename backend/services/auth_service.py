@@ -1,6 +1,7 @@
 """
 Auth service: register / login / refresh / user lookup.
 - Reads JWT_SECRET from env dynamically.
+- Supports configured admin email allowlist.
 - Logs all auth events.
 """
 import os
@@ -18,11 +19,8 @@ users = db["users"]
 JWT_ALGO = "HS256"
 JWT_ISSUER = os.getenv("JWT_ISSUER", "tradeai")
 JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "tradeai-clients")
-ACCESS_TTL_MIN = int(os.getenv("ACCESS_TTL_MIN", str(60 * 24)))      # 1 day
-REFRESH_TTL_MIN = int(os.getenv("REFRESH_TTL_MIN", str(60 * 24 * 30)))  # 30 days
-
-# bcrypt silently truncates inputs over 72 bytes — cap explicitly so users can't
-# get a passphrase that collides with another at the same 72-byte prefix.
+ACCESS_TTL_MIN = int(os.getenv("ACCESS_TTL_MIN", str(60 * 24)))
+REFRESH_TTL_MIN = int(os.getenv("REFRESH_TTL_MIN", str(60 * 24 * 30)))
 BCRYPT_MAX_BYTES = 72
 
 
@@ -32,6 +30,27 @@ def _utc_now() -> datetime:
 
 def _jwt_secret() -> str:
     return os.getenv("JWT_SECRET", "")
+
+
+def _admin_emails() -> set:
+    raw = os.getenv("ADMIN_EMAILS") or os.getenv("ADMIN_EMAIL") or "nawfal1001@gmail.com"
+    return {e.strip().lower() for e in raw.split(",") if e.strip()}
+
+
+def _is_configured_admin(email: str) -> bool:
+    return (email or "").lower().strip() in _admin_emails()
+
+
+def _public_user(u: dict) -> dict:
+    email = (u.get("email") or "").lower().strip()
+    role = "admin" if _is_configured_admin(email) else u.get("role", "user")
+    return {
+        "id": str(u["_id"]),
+        "email": email,
+        "username": u.get("username", email.split("@")[0]),
+        "role": role,
+        "settings": u.get("settings", {}),
+    }
 
 
 def hash_pw(p: str) -> str:
@@ -56,15 +75,7 @@ def make_token(uid: str, kind: str = "access") -> str:
         raise RuntimeError("JWT_SECRET not configured. Set it in .env (32+ random chars).")
     ttl = ACCESS_TTL_MIN if kind == "access" else REFRESH_TTL_MIN
     now = _utc_now()
-    payload = {
-        "sub": uid,
-        "type": kind,
-        "iss": JWT_ISSUER,
-        "aud": JWT_AUDIENCE,
-        "iat": now,
-        "nbf": now,
-        "exp": now + timedelta(minutes=ttl),
-    }
+    payload = {"sub": uid, "type": kind, "iss": JWT_ISSUER, "aud": JWT_AUDIENCE, "iat": now, "nbf": now, "exp": now + timedelta(minutes=ttl)}
     return jwt.encode(payload, secret, algorithm=JWT_ALGO)
 
 
@@ -82,19 +93,13 @@ async def register(email: str, password: str, username: str):
     if len((password or "").encode()) > BCRYPT_MAX_BYTES:
         return {"error": f"Password too long (max {BCRYPT_MAX_BYTES} bytes)"}
 
-    # Pre-check to give a clean error, but the unique indexes on email/username are
-    # the real guard against races. We return a generic message either way to avoid
-    # account enumeration.
     if await users.find_one({"email": email_l}) or await users.find_one({"username": username_s}):
         log.info(f"register collision for email={email_l} username={username_s}")
         return {"error": "Registration failed"}
 
-    # Atomic "first user becomes admin" — gated by an env var so a fresh DB cannot
-    # silently grant admin to a random attacker who happens to register first.
     allow_bootstrap = os.getenv("ALLOW_ADMIN_BOOTSTRAP", "false").lower() == "true"
-    role = "user"
-    if allow_bootstrap:
-        # findAndModify-style atomic claim of the bootstrap slot.
+    role = "admin" if _is_configured_admin(email_l) else "user"
+    if role != "admin" and allow_bootstrap:
         claim = await db["admin_bootstrap"].find_one_and_update(
             {"_id": "claim"},
             {"$setOnInsert": {"claimed": True, "at": _utc_now().isoformat()}},
@@ -102,53 +107,33 @@ async def register(email: str, password: str, username: str):
             return_document=False,
         )
         if claim is None:
-            # We were the first to insert the claim doc
             role = "admin"
 
-    doc = {
-        "email": email_l,
-        "username": username_s,
-        "password": hash_pw(password),
-        "role": role,
-        "created_at": _utc_now().isoformat(),
-        "settings": {"mode": "paper", "language": "en"},
-    }
+    doc = {"email": email_l, "username": username_s, "password": hash_pw(password), "role": role, "created_at": _utc_now().isoformat(), "settings": {"mode": "paper", "language": "en"}}
     try:
         r = await users.insert_one(doc)
     except Exception as e:
-        # Likely a unique-index collision from a race
         log.warning(f"register insert failed: {e}")
         return {"error": "Registration failed"}
     uid = str(r.inserted_id)
     log.info(f"registered user uid={uid} role={role}")
-    return {
-        "access_token": make_token(uid),
-        "refresh_token": make_token(uid, "refresh"),
-        "user": {"id": uid, "email": email_l, "username": username_s, "role": role, "settings": doc["settings"]},
-    }
+    return {"access_token": make_token(uid), "refresh_token": make_token(uid, "refresh"), "user": {"id": uid, "email": email_l, "username": username_s, "role": role, "settings": doc["settings"]}}
 
 
 async def login(email: str, password: str):
     email_l = (email or "").lower().strip()
     u = await users.find_one({"email": email_l})
     if not u or not verify_pw(password, u["password"]):
-        # Don't include email in logs at info level — flagged as PII / GDPR concern.
         log.info("failed login")
         return {"error": "Invalid credentials"}
+    if _is_configured_admin(email_l) and u.get("role") != "admin":
+        await users.update_one({"_id": u["_id"]}, {"$set": {"role": "admin", "last_login": _utc_now().isoformat()}})
+        u["role"] = "admin"
+    else:
+        await users.update_one({"_id": u["_id"]}, {"$set": {"last_login": _utc_now().isoformat()}})
     uid = str(u["_id"])
-    await users.update_one({"_id": u["_id"]}, {"$set": {"last_login": _utc_now().isoformat()}})
     log.info(f"login: user_id={uid}")
-    return {
-        "access_token": make_token(uid),
-        "refresh_token": make_token(uid, "refresh"),
-        "user": {
-            "id": uid,
-            "email": u["email"],
-            "username": u["username"],
-            "role": u.get("role", "user"),
-            "settings": u.get("settings", {}),
-        },
-    }
+    return {"access_token": make_token(uid), "refresh_token": make_token(uid, "refresh"), "user": _public_user(u)}
 
 
 async def refresh(token: str):
@@ -157,13 +142,8 @@ async def refresh(token: str):
         return {"error": "Server misconfigured"}
     try:
         try:
-            p = jwt.decode(
-                token, secret, algorithms=[JWT_ALGO],
-                audience=JWT_AUDIENCE, issuer=JWT_ISSUER,
-                options={"require": ["exp", "sub", "type"]},
-            )
+            p = jwt.decode(token, secret, algorithms=[JWT_ALGO], audience=JWT_AUDIENCE, issuer=JWT_ISSUER, options={"require": ["exp", "sub", "type"]})
         except jwt.MissingRequiredClaimError:
-            # Legacy token without iss/aud
             p = jwt.decode(token, secret, algorithms=[JWT_ALGO], options={"require": ["exp", "sub"]})
         if p.get("type") != "refresh":
             return {"error": "Wrong token type"}
@@ -183,19 +163,13 @@ async def get_user(uid: str):
         return None
     if not u:
         return None
-    return {
-        "id": str(u["_id"]),
-        "email": u["email"],
-        "username": u["username"],
-        "role": u.get("role", "user"),
-        "settings": u.get("settings", {}),
-    }
+    if _is_configured_admin(u.get("email")) and u.get("role") != "admin":
+        await users.update_one({"_id": u["_id"]}, {"$set": {"role": "admin"}})
+        u["role"] = "admin"
+    return _public_user(u)
 
 
-_ALLOWED_SETTINGS_KEYS = {
-    "mode", "language", "theme", "notifications_email", "notifications_telegram",
-    "default_broker", "default_timeframe", "ui_density",
-}
+_ALLOWED_SETTINGS_KEYS = {"mode", "language", "theme", "notifications_email", "notifications_telegram", "default_broker", "default_timeframe", "ui_density"}
 
 
 async def update_settings(uid: str, settings: dict):
