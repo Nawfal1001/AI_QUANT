@@ -303,6 +303,13 @@ async def _runner_loop():
     log.info("bot_runner started")
     while _running:
         try:
+            # Respect the frontend kill-switch for the normal bot fleet. If an
+            # operator toggles this off in /api/runtime-controls the loop keeps
+            # ticking but skips every cycle.
+            from services.runtime_controls import is_normal_bots_enabled
+            if not await is_normal_bots_enabled():
+                await asyncio.sleep(15)
+                continue
             bots = await get_active_bots()
             now = datetime.utcnow()
             due = [bot for bot in bots if (_parse_dt(bot.get("next_run_at")) is None or _parse_dt(bot.get("next_run_at")) <= now)]

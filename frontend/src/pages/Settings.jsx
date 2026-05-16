@@ -4,7 +4,7 @@ import { useStore } from '@/store'
 import { useAuthStore } from '@/store/auth'
 import { Card, Button, Input, Toggle, PageHeader, SectionTitle, Loading, Grid } from '@/components/ui'
 import { tokens } from '@/components/ui/tokens'
-import { Shield, Brain, LogOut, Save, Power, AlertTriangle, RefreshCw } from 'lucide-react'
+import { Shield, Brain, LogOut, Save, Power, AlertTriangle, RefreshCw, Zap } from 'lucide-react'
 import toast from 'react-hot-toast'
 
 const row = { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 0', borderBottom: `1px solid ${tokens.border}` }
@@ -21,17 +21,22 @@ export default function Settings() {
     max_position_size_pct: '',
   })
   const [riskStatus, setRiskStatus] = useState(null)
+  const [controls, setControls] = useState(null)
+  const [savingControls, setSavingControls] = useState(false)
 
   const [learning, setLearning] = useState({
     meta: true, memory: true, rl: true, defensive: true, hyper: true, sentiment: true, micro: true,
   })
 
+  const isAdmin = user?.role === 'admin'
+
   async function load() {
     setLoading(true)
     try {
-      const [s, l] = await Promise.all([
+      const [s, l, c] = await Promise.all([
         api.get('/risk/status').catch(() => ({ data: null })),
         api.get('/risk/limits').catch(() => ({ data: null })),
+        api.get('/runtime-controls/').catch(() => ({ data: null })),
       ])
       if (s.data) setRiskStatus(s.data)
       if (l.data?.limits) setLimits({
@@ -40,8 +45,28 @@ export default function Settings() {
         max_open_trades: l.data.limits.max_open_trades ?? '',
         max_position_size_pct: l.data.limits.max_position_size_pct ?? '',
       })
+      if (c.data) setControls(c.data)
     } catch (e) { console.error(e) }
     setLoading(false)
+  }
+
+  async function toggleControl(key, value) {
+    if (!isAdmin) {
+      toast.error('Only admins can change runtime controls')
+      return
+    }
+    const prev = controls
+    setControls({ ...controls, [key]: value })
+    setSavingControls(true)
+    try {
+      const res = await api.patch('/runtime-controls/', { [key]: value })
+      setControls(res.data)
+      toast.success(`${key.replace(/_/g, ' ')}: ${value ? 'on' : 'off'}`)
+    } catch (e) {
+      setControls(prev)
+      toast.error(e?.response?.data?.detail || 'Failed')
+    }
+    setSavingControls(false)
   }
   useEffect(() => { load() }, [])
 
@@ -168,6 +193,39 @@ export default function Settings() {
             </div>
           ))}
         </Card>
+
+        {controls && (
+          <Card>
+            <SectionTitle icon={<Zap size={14} color={tokens.warning} />}>Runtime Controls {!isAdmin && <span style={{ fontSize: 10, color: tokens.textMuted, marginLeft: 6 }}>(admin only)</span>}</SectionTitle>
+            <div style={{ fontSize: tokens.fs_sm, color: tokens.textMuted, marginBottom: 10, lineHeight: 1.5 }}>
+              Live kill-switches for the trading stack. Flipping these takes effect on the next scheduler tick — no backend restart needed.
+            </div>
+            {[
+              ['live_trading_enabled', 'Live trading', 'Allow real-broker orders. Server-side LIVE_TRADING_ENABLED or ALLOW_FRONTEND_LIVE_OVERRIDE must also be set in env.'],
+              ['auto_trader_enabled', 'Auto-trader', 'Master switch for the auto_trader scan loop.'],
+              ['normal_bots_enabled', 'Normal bots', 'Pause/resume the standard bot fleet without disabling each bot.'],
+              ['emergency_macro_enabled', 'Emergency macro bots', 'Run macro-event-driven emergency trades on releases (CPI, NFP, FOMC).'],
+              ['economic_events_enabled', 'Economic event scanner', 'Background scanner that detects due macro releases.'],
+              ['require_live_confirmation', 'Require live confirmation', 'Every live order must pass confirm_live=true (a UI confirm step).'],
+            ].map(([key, label, desc], i, arr) => (
+              <div key={key} style={{ ...row, ...(i === arr.length - 1 ? { borderBottom: 'none' } : {}) }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: tokens.fs_md, color: tokens.text }}>{label}</div>
+                  <div style={{ fontSize: tokens.fs_sm, color: tokens.textMuted, lineHeight: 1.4 }}>{desc}</div>
+                </div>
+                <Toggle value={!!controls[key]} onChange={v => toggleControl(key, v)} disabled={!isAdmin || savingControls} />
+              </div>
+            ))}
+            {controls.live_trading_enabled && !controls.effective_live_trading_enabled && (
+              <div style={{ marginTop: 10, padding: '8px 12px', background: 'rgba(248,81,73,0.08)', border: `1px solid ${tokens.danger}`, borderRadius: 6, fontSize: 11, color: tokens.danger, lineHeight: 1.5 }}>
+                Live trading is toggled ON but the server hard-lock is in place. Ask your operator to set
+                <code style={{ background: tokens.bg, padding: '0 4px', borderRadius: 3, margin: '0 2px' }}>ALLOW_FRONTEND_LIVE_OVERRIDE=true</code>
+                or <code style={{ background: tokens.bg, padding: '0 4px', borderRadius: 3, margin: '0 2px' }}>LIVE_TRADING_ENABLED=true</code>
+                so this toggle takes effect.
+              </div>
+            )}
+          </Card>
+        )}
 
         <Card>
           <SectionTitle icon={<RefreshCw size={14} />}>Paper Account</SectionTitle>

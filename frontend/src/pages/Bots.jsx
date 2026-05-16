@@ -297,11 +297,14 @@ export default function Bots() {
                   onChange={e => updateWatchlist(idx, { asset_type: e.target.value })}
                   style={{
                     background: tokens.bg, border: `1px solid ${tokens.border}`,
-                    borderRadius: 6, padding: '7px 10px', color: tokens.text, fontSize: 12, outline: 'none', width: 100,
+                    borderRadius: 6, padding: '7px 10px', color: tokens.text, fontSize: 12, outline: 'none', width: 110,
                   }}
                 >
                   <option value="stock">Stock</option>
                   <option value="crypto">Crypto</option>
+                  <option value="forex">Forex</option>
+                  <option value="oil">Oil</option>
+                  <option value="gold">Gold</option>
                 </select>
                 <button onClick={() => removeWatchlist(idx)} style={{ background: 'none', border: 'none', color: tokens.danger, cursor: 'pointer', padding: 6 }}>
                   <Trash2 size={13} />
@@ -338,9 +341,7 @@ export default function Bots() {
           {/* Live mode info */}
           {editing.broker !== 'paper' && (
             <div style={{ marginTop: 14, padding: '10px 12px', background: 'rgba(248,81,73,0.08)', borderRadius: 8, fontSize: 12, color: tokens.danger, lineHeight: 1.5 }}>
-              <strong>⚠ Live trading.</strong> This bot will place real orders on {editing.broker}. The broker must be connected (Brokers page),
-              <code style={{ color: tokens.text, background: tokens.bg, padding: '0 4px', borderRadius: 3, margin: '0 2px' }}>LIVE_TRADING_ENABLED=true</code>
-              in your .env, and your risk limits will gate every order.
+              <strong>⚠ Live trading.</strong> This bot will place real orders on {editing.broker}. Make sure: the broker is connected (Brokers page), live trading is enabled in Settings → Runtime Controls, and your risk limits are configured. Every order is double-gated by the runtime controls and the risk engine.
             </div>
           )}
         </Card>

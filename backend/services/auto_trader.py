@@ -35,6 +35,14 @@ async def update_config(updates):
 async def scan_and_execute():
     config=await get_config()
     if not config.get("enabled"): return {"status":"disabled"}
+    # Frontend kill-switch — operator can disable the auto-trader without
+    # touching the per-config flag.
+    try:
+        from services.runtime_controls import is_auto_trader_enabled
+        if not await is_auto_trader_enabled():
+            return {"status":"disabled_runtime","reason":"auto_trader_enabled is off in runtime controls"}
+    except Exception as _e:
+        _log.debug(f"runtime_controls check skipped: {_e}")
 
     # ── DEFENSIVE MODE CHECK ──
     defensive_adj = {"halt_trading":False,"size_multiplier":1.0,"min_confidence":config.get("min_confidence",70),"allowed_regimes":None}
