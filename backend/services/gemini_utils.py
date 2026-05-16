@@ -23,12 +23,23 @@ Think like a professional desk analyst:
 """.strip()
 
 
+def get_gemini_api_key() -> str:
+    # Accept common misspellings/aliases used in deployment dashboards.
+    return (
+        os.getenv("GEMINI_API_KEY")
+        or os.getenv("GEMINY_API_KEY")
+        or os.getenv("GOOGLE_API_KEY")
+        or os.getenv("GOOGLE_GEMINI_API_KEY")
+        or ""
+    ).strip()
+
+
 def gemini_available() -> bool:
-    return bool(os.getenv("GEMINI_API_KEY", "").strip())
+    return bool(get_gemini_api_key())
 
 
 def get_model():
-    genai.configure(api_key=os.getenv("GEMINI_API_KEY", ""))
+    genai.configure(api_key=get_gemini_api_key())
     return genai.GenerativeModel(os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))
 
 
