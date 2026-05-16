@@ -1,21 +1,35 @@
 """
-Backtest Engine v2.2 — shared multi-provider, multi-asset OHLCV fetcher.
-Supports stocks, crypto, forex, gold, oil and common broker/CFD aliases.
+Backtest Engine v2.3 — dynamic broker/data-provider OHLCV fetcher.
+Signals, auto scanner, paper bots and backtests use this shared fetch_history().
 """
 import asyncio, math, os
 from datetime import datetime, timedelta
 from functools import partial
+from io import StringIO
 import numpy as np, pandas as pd
 from services.strategies import STRATEGIES
 from services.logger import child
 log = child("backtest")
 DEFAULT_FEE_BPS = 5; DEFAULT_SLIPPAGE_BPS = 3; DEFAULT_SPREAD_BPS = 2; _HISTORY_CACHE = {}
-YAHOO_SPECIAL = {"XAUUSD":"GC=F","XAU_USD":"GC=F","GOLD":"GC=F","GC":"GC=F","GC=F":"GC=F","XAGUSD":"SI=F","XAG_USD":"SI=F","SILVER":"SI=F","SI":"SI=F","SI=F":"SI=F","OIL":"CL=F","WTI":"CL=F","CL":"CL=F","CL=F":"CL=F","BRENT":"BZ=F","BZ":"BZ=F","BZ=F":"BZ=F"}
-USD_BASE_YAHOO = {"USD_JPY":"JPY=X","USDJPY":"JPY=X","USD_CHF":"CHF=X","USDCHF":"CHF=X","USD_CAD":"CAD=X","USDCAD":"CAD=X","USD_MXN":"MXN=X","USDMXN":"MXN=X"}
+YAHOO_SPECIAL={"XAUUSD":"GC=F","XAU_USD":"GC=F","GOLD":"GC=F","GC":"GC=F","GC=F":"GC=F","XAGUSD":"SI=F","XAG_USD":"SI=F","SILVER":"SI=F","SI":"SI=F","SI=F":"SI=F","OIL":"CL=F","WTI":"CL=F","CL":"CL=F","CL=F":"CL=F","BRENT":"BZ=F","BZ":"BZ=F","BZ=F":"BZ=F"}
+USD_BASE_YAHOO={"USD_JPY":"JPY=X","USDJPY":"JPY=X","USD_CHF":"CHF=X","USDCHF":"CHF=X","USD_CAD":"CAD=X","USDCAD":"CAD=X","USD_MXN":"MXN=X","USDMXN":"MXN=X"}
 
-def _cache_key(ticker, asset_type, start, end, interval): return f"{asset_type}:{str(ticker).upper()}:{start}:{end}:{interval}"
+def _cache_key(ticker,asset_type,start,end,interval): return f"{asset_type}:{str(ticker).upper()}:{start}:{end}:{interval}"
+def _env(*names):
+    for n in names:
+        v=os.getenv(n)
+        if v: return v.strip()
+    return ""
+def _configured_providers(asset_type):
+    default="alpaca,alpha_vantage,stooq,yahoo" if asset_type=="stock" else "oanda,twelvedata,finnhub,yahoo" if asset_type in {"forex","fx"} else "kraken,coinbase,okx,bybit,binance,yahoo"
+    raw=_env("MARKET_DATA_PROVIDERS",f"{asset_type.upper()}_DATA_PROVIDERS") or default
+    providers=[p.strip().lower() for p in raw.split(",") if p.strip()]
+    if asset_type=="stock" and _env("ALPACA_API_KEY","APCA_API_KEY_ID") and "alpaca" not in providers: providers.insert(0,"alpaca")
+    if asset_type in {"forex","fx"} and _env("OANDA_API_KEY","OANDA_TOKEN") and "oanda" not in providers: providers.insert(0,"oanda")
+    return providers
+
 def _base_crypto(symbol): return str(symbol or "").upper().replace("/USDT","").replace("USDT","").replace("_USDT","").replace("-USD","").replace("/USD","").replace("USD","")
-def _to_yahoo_symbol(ticker, asset_type="stock"):
+def _to_yahoo_symbol(ticker,asset_type="stock"):
     raw=str(ticker or "").upper().strip().replace("/","_").replace("-","_").replace(" ","").replace(".FX","").replace(".FOREX","")
     if asset_type=="crypto": return f"{_base_crypto(raw)}-USD"
     if raw in YAHOO_SPECIAL: return YAHOO_SPECIAL[raw]
@@ -29,18 +43,38 @@ def _normalize_history_frame(hist):
     if hist is None or len(hist)==0: return None
     hist=hist.copy()
     if isinstance(hist.columns,pd.MultiIndex): hist.columns=[c[0] if isinstance(c,tuple) else c for c in hist.columns]
-    if "Date" not in hist.columns and "Datetime" not in hist.columns and "date" not in hist.columns: hist=hist.reset_index()
+    if "Date" not in hist.columns and "Datetime" not in hist.columns and "date" not in hist.columns and "time" not in hist.columns and "t" not in hist.columns: hist=hist.reset_index()
     cols={str(c).lower().replace(" ","_"):c for c in hist.columns}
-    date_col=cols.get("date") or cols.get("datetime") or cols.get("index"); open_col=cols.get("open"); high_col=cols.get("high"); low_col=cols.get("low"); close_col=cols.get("close") or cols.get("adj_close") or cols.get("adjusted_close"); volume_col=cols.get("volume")
+    date_col=cols.get("date") or cols.get("datetime") or cols.get("time") or cols.get("timestamp") or cols.get("t") or cols.get("index")
+    open_col=cols.get("open") or cols.get("o"); high_col=cols.get("high") or cols.get("h"); low_col=cols.get("low") or cols.get("l"); close_col=cols.get("close") or cols.get("c") or cols.get("adj_close") or cols.get("adjusted_close"); volume_col=cols.get("volume") or cols.get("v")
     if not all([date_col,open_col,high_col,low_col,close_col]): log.warning(f"history frame missing OHLC columns: {list(hist.columns)}"); return None
-    out=pd.DataFrame({"date":pd.to_datetime(hist[date_col],errors="coerce"),"open":pd.to_numeric(hist[open_col],errors="coerce"),"high":pd.to_numeric(hist[high_col],errors="coerce"),"low":pd.to_numeric(hist[low_col],errors="coerce"),"close":pd.to_numeric(hist[close_col],errors="coerce"),"volume":pd.to_numeric(hist[volume_col],errors="coerce") if volume_col else 0}).dropna(subset=["date","open","high","low","close"])
+    date_series=hist[date_col]
+    if pd.api.types.is_numeric_dtype(date_series):
+        mx=pd.to_numeric(date_series,errors="coerce").max(); unit="ms" if mx and mx>10_000_000_000 else "s" if mx and mx>10_000_000 else None
+        dates=pd.to_datetime(date_series,unit=unit,errors="coerce") if unit else pd.to_datetime(date_series,errors="coerce")
+    else: dates=pd.to_datetime(date_series,errors="coerce")
+    out=pd.DataFrame({"date":dates,"open":pd.to_numeric(hist[open_col],errors="coerce"),"high":pd.to_numeric(hist[high_col],errors="coerce"),"low":pd.to_numeric(hist[low_col],errors="coerce"),"close":pd.to_numeric(hist[close_col],errors="coerce"),"volume":pd.to_numeric(hist[volume_col],errors="coerce") if volume_col else 0}).dropna(subset=["date","open","high","low","close"])
     return out.sort_values("date") if len(out) else None
+
+def _fetch_alpaca_stock_history(ticker,start,end,interval="1d"):
+    key=_env("ALPACA_API_KEY","APCA_API_KEY_ID"); secret=_env("ALPACA_SECRET_KEY","APCA_API_SECRET_KEY"); feed=_env("ALPACA_DATA_FEED") or "iex"
+    if not key or not secret: return None
+    try:
+        import httpx
+        tf={"1m":"1Min","5m":"5Min","15m":"15Min","30m":"30Min","1h":"1Hour","4h":"4Hour","1d":"1Day"}.get(interval,"1Day")
+        url=f"https://data.alpaca.markets/v2/stocks/{str(ticker).upper()}/bars"
+        params={"timeframe":tf,"start":pd.Timestamp(start).isoformat()+"Z","end":pd.Timestamp(end).isoformat()+"Z","feed":feed,"limit":10000,"adjustment":"raw"}
+        r=httpx.get(url,params=params,headers={"APCA-API-KEY-ID":key,"APCA-API-SECRET-KEY":secret},timeout=20); r.raise_for_status(); bars=r.json().get("bars") or []
+        df=_normalize_history_frame(pd.DataFrame(bars)) if bars else None
+        if df is not None and len(df): log.info(f"stock candles for {ticker} loaded from alpaca/{feed}")
+        return df
+    except Exception as e: log.warning(f"Alpaca stock data failed for {ticker}: {e}"); return None
 
 def _fetch_yahoo_history(symbol,start,end,interval="1d"):
     try:
         import yfinance as yf
         for method in ("download","ticker"):
-            hist = yf.download(symbol,start=start,end=end,interval=interval,progress=False,auto_adjust=False,threads=False) if method=="download" else yf.Ticker(symbol).history(start=start,end=end,interval=interval,auto_adjust=False,raise_errors=False)
+            hist=yf.download(symbol,start=start,end=end,interval=interval,progress=False,auto_adjust=False,threads=False) if method=="download" else yf.Ticker(symbol).history(start=start,end=end,interval=interval,auto_adjust=False,raise_errors=False)
             df=_normalize_history_frame(hist)
             if df is not None and len(df)>0: return df
         log.warning(f"Yahoo returned 0 candles for {symbol}")
@@ -55,14 +89,12 @@ def _fetch_stooq_stock_history(ticker,start,end):
         url=f"https://stooq.com/q/d/l/?s={symbol}&d1={pd.Timestamp(start).strftime('%Y%m%d')}&d2={pd.Timestamp(end).strftime('%Y%m%d')}&i=d"
         r=httpx.get(url,timeout=15); r.raise_for_status()
         if not r.text or "No data" in r.text or len(r.text.splitlines())<2: return None
-        from io import StringIO
-        df=pd.read_csv(StringIO(r.text))
-        return _normalize_history_frame(df)
+        return _normalize_history_frame(pd.read_csv(StringIO(r.text)))
     except Exception as e: log.warning(f"Stooq fallback failed for {ticker}: {e}"); return None
 
 def _fetch_alpha_vantage_stock_history(ticker,start,end,interval="1d"):
-    key=(os.getenv("ALPHA_VANTAGE_API_KEY") or os.getenv("ALPHAVANTAGE_API_KEY") or "").strip()
-    if not key: log.warning("Alpha Vantage fallback unavailable: ALPHA_VANTAGE_API_KEY missing"); return None
+    key=_env("ALPHA_VANTAGE_API_KEY","ALPHAVANTAGE_API_KEY")
+    if not key: return None
     try:
         import httpx
         is_daily=interval in {"1d","1D","day","daily"}
@@ -78,33 +110,63 @@ def _fetch_alpha_vantage_stock_history(ticker,start,end,interval="1d"):
         return _normalize_history_frame(pd.DataFrame(rows)) if rows else None
     except Exception as e: log.warning(f"Alpha Vantage stock fallback failed for {ticker}: {e}"); return None
 
+def _fetch_oanda_forex_history(ticker,start,end,interval="1d"):
+    token=_env("OANDA_API_KEY","OANDA_TOKEN"); account_type=(_env("OANDA_ENV","OANDA_ACCOUNT_TYPE") or "practice").lower()
+    if not token: return None
+    try:
+        import httpx
+        instr=str(ticker).upper().replace("/","_").replace("-","_")
+        gran={"1m":"M1","5m":"M5","15m":"M15","30m":"M30","1h":"H1","4h":"H4","1d":"D"}.get(interval,"D")
+        host="https://api-fxpractice.oanda.com" if account_type!="live" else "https://api-fxtrade.oanda.com"
+        r=httpx.get(f"{host}/v3/instruments/{instr}/candles",params={"from":pd.Timestamp(start).isoformat()+"Z","to":pd.Timestamp(end).isoformat()+"Z","granularity":gran,"price":"M"},headers={"Authorization":f"Bearer {token}"},timeout=20); r.raise_for_status()
+        rows=[]
+        for c in r.json().get("candles",[]):
+            if not c.get("complete",True): continue
+            m=c.get("mid",{}); rows.append({"date":c.get("time"),"open":m.get("o"),"high":m.get("h"),"low":m.get("l"),"close":m.get("c"),"volume":c.get("volume",0)})
+        df=_normalize_history_frame(pd.DataFrame(rows)) if rows else None
+        if df is not None and len(df): log.info(f"forex candles for {ticker} loaded from oanda")
+        return df
+    except Exception as e: log.warning(f"Oanda forex data failed for {ticker}: {e}"); return None
+
 def _fetch_stock_history(ticker,start,end,interval="1d"):
     symbol=_to_yahoo_symbol(ticker,"stock")
-    return _fetch_yahoo_history(symbol,start,end,interval) or _fetch_alpha_vantage_stock_history(symbol,start,end,interval) or _fetch_stooq_stock_history(symbol,start,end)
+    for p in _configured_providers("stock"):
+        df={"alpaca":lambda:_fetch_alpaca_stock_history(symbol,start,end,interval),"alpha_vantage":lambda:_fetch_alpha_vantage_stock_history(symbol,start,end,interval),"stooq":lambda:_fetch_stooq_stock_history(symbol,start,end),"yahoo":lambda:_fetch_yahoo_history(symbol,start,end,interval)}.get(p,lambda:None)()
+        if df is not None and len(df)>0: return df
+    return None
 
 def _fetch_yahoo_asset_history(ticker,asset_type,start,end,interval="1d"):
     return _fetch_yahoo_history(_to_yahoo_symbol(ticker,asset_type),start,end,interval)
 
+def _fetch_forex_history(ticker,start,end,interval="1d"):
+    for p in _configured_providers("forex"):
+        df={"oanda":lambda:_fetch_oanda_forex_history(ticker,start,end,interval),"yahoo":lambda:_fetch_yahoo_asset_history(ticker,"forex",start,end,interval)}.get(p,lambda:None)()
+        if df is not None and len(df)>0: return df
+    return None
+
 def _fetch_crypto_history(symbol,start,end,interval="1d"):
-    base=_base_crypto(symbol); tf_map={"1m":"1m","5m":"5m","15m":"15m","30m":"30m","1d":"1d","4h":"4h","1h":"1h"}; tf=tf_map.get(interval,"1d")
+    base=_base_crypto(symbol); tf={"1m":"1m","5m":"5m","15m":"15m","30m":"30m","1d":"1d","4h":"4h","1h":"1h"}.get(interval,"1d")
     try:
         import ccxt
-        for ex_name,pair in [("kraken",f"{base}/USD"),("coinbase",f"{base}/USD"),("okx",f"{base}/USDT"),("bybit",f"{base}/USDT"),("binance",f"{base}/USDT")]:
+        for ex_name in _configured_providers("crypto"):
+            if ex_name=="yahoo":
+                df=_fetch_yahoo_history(_to_yahoo_symbol(base,"crypto"),start,end,interval)
+                if df is not None and len(df)>0: return df
+                continue
             try:
-                ex=getattr(ccxt,ex_name)({"enableRateLimit":True})
-                since_ms=int(pd.Timestamp(start).timestamp()*1000); end_ms=int(pd.Timestamp(end).timestamp()*1000); all_bars=[]; cursor=since_ms
+                pair=f"{base}/USD" if ex_name in {"kraken","coinbase"} else f"{base}/USDT"
+                ex=getattr(ccxt,ex_name)({"enableRateLimit":True}); since_ms=int(pd.Timestamp(start).timestamp()*1000); end_ms=int(pd.Timestamp(end).timestamp()*1000); bars=[]; cursor=since_ms
                 while cursor<end_ms:
-                    bars=ex.fetch_ohlcv(pair,tf,since=cursor,limit=1000)
-                    if not bars: break
-                    all_bars.extend(bars); cursor=bars[-1][0]+1
-                    if len(bars)<1000: break
-                if all_bars:
-                    df=pd.DataFrame(all_bars,columns=["ts","open","high","low","close","volume"]); df["date"]=pd.to_datetime(df["ts"],unit="ms"); df=df[df["date"]<=pd.Timestamp(end)]
+                    chunk=ex.fetch_ohlcv(pair,tf,since=cursor,limit=1000)
+                    if not chunk: break
+                    bars.extend(chunk); cursor=chunk[-1][0]+1
+                    if len(chunk)<1000: break
+                if bars:
+                    df=pd.DataFrame(bars,columns=["ts","open","high","low","close","volume"]); df["date"]=pd.to_datetime(df["ts"],unit="ms"); df=df[df["date"]<=pd.Timestamp(end)]
                     log.info(f"crypto candles for {base} loaded from {ex_name}")
                     return df[["date","open","high","low","close","volume"]]
-            except Exception as e: log.warning(f"ccxt {ex_name} failed for {pair}: {e}")
+            except Exception as e: log.warning(f"ccxt {ex_name} failed for {base}: {e}")
     except Exception as e: log.warning(f"ccxt unavailable for {base}: {e}")
-    log.warning(f"all ccxt crypto providers failed for {base}; trying Yahoo crypto")
     return _fetch_yahoo_history(_to_yahoo_symbol(base,"crypto"),start,end,interval)
 
 async def fetch_history(ticker,asset_type,start,end,interval="1d"):
@@ -112,7 +174,8 @@ async def fetch_history(ticker,asset_type,start,end,interval="1d"):
     if cached and now-cached["ts"]<900: return cached["df"].copy() if cached["df"] is not None else None
     loop=asyncio.get_event_loop()
     if at=="crypto": df=await loop.run_in_executor(None,partial(_fetch_crypto_history,ticker,start,end,interval))
-    elif at in {"forex","fx","gold","oil","metal","metals","commodity","future","futures"}: df=await loop.run_in_executor(None,partial(_fetch_yahoo_asset_history,ticker,at,start,end,interval))
+    elif at in {"forex","fx"}: df=await loop.run_in_executor(None,partial(_fetch_forex_history,ticker,start,end,interval))
+    elif at in {"gold","oil","metal","metals","commodity","future","futures"}: df=await loop.run_in_executor(None,partial(_fetch_yahoo_asset_history,ticker,at,start,end,interval))
     else: df=await loop.run_in_executor(None,partial(_fetch_stock_history,ticker,start,end,interval))
     _HISTORY_CACHE[key]={"ts":now,"df":df.copy() if df is not None else None}; return df
 
