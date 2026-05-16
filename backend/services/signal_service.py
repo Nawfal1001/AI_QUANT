@@ -16,16 +16,34 @@ _log = _child_log('signal_service')
 
 TF = {"scalping":{"period":50,"atr":14,"sl":0.5,"tp":1.0},"intraday":{"period":100,"atr":14,"sl":1.0,"tp":2.0},"swing":{"period":200,"atr":14,"sl":1.5,"tp":3.0},"position":{"period":300,"atr":14,"sl":2.0,"tp":4.0}}
 
-def _fetch(ticker,atype,period):
+def _fetch(ticker, atype, period):
     try:
-        if atype=="stock":
-            h=yf.Ticker(ticker).history(period="1y",interval="1d")
-            if h.empty: return pd.DataFrame()
-            df=h[["Open","High","Low","Close","Volume"]].copy(); df.columns=["open","high","low","close","volume"]; return df.dropna().tail(period)
+        if atype == "stock":
+            # Try yf.download first (more reliable in yfinance 0.2.38+)
+            h = yf.download(ticker, period="1y", interval="1d",
+                            auto_adjust=True, progress=False, threads=False)
+            if isinstance(h.columns, pd.MultiIndex):
+                h.columns = h.columns.droplevel(1)
+            if h.empty:
+                # fallback to Ticker.history
+                h = yf.Ticker(ticker).history(period="1y", interval="1d", auto_adjust=True)
+            if h.empty:
+                return pd.DataFrame()
+            # Normalize to lowercase column names
+            h.columns = [c.lower() for c in h.columns]
+            needed = [c for c in ["open","high","low","close","volume"] if c in h.columns]
+            if len(needed) < 5:
+                return pd.DataFrame()
+            df = h[needed].copy()
+            df.columns = ["open","high","low","close","volume"]
+            return df.dropna().tail(period)
         else:
-            ohlcv=ccxt.binance().fetch_ohlcv(f"{ticker}/USDT","1d",limit=period)
-            df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","volume"]); return df[["open","high","low","close","volume"]].dropna()
-    except: return pd.DataFrame()
+            ohlcv = ccxt.binance().fetch_ohlcv(f"{ticker}/USDT", "1d", limit=period)
+            df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
+            return df[["open","high","low","close","volume"]].dropna()
+    except Exception as e:
+        _log.debug(f"_fetch {ticker} {atype} error: {e}")
+        return pd.DataFrame()
 
 def rsi(c):
     try:
