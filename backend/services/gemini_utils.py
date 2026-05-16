@@ -22,9 +22,18 @@ Think like a professional desk analyst:
 - Never pretend to have live data unless the provided input includes it.
 """.strip()
 
+DEFAULT_GEMINI_MODEL = "gemini-1.5-flash"
+PRO_MODEL_ALIASES = {
+    "gemini-pro",
+    "gemini-1.0-pro",
+    "gemini-1.5-pro",
+    "models/gemini-pro",
+    "models/gemini-1.0-pro",
+    "models/gemini-1.5-pro",
+}
+
 
 def get_gemini_api_key() -> str:
-    # Accept common misspellings/aliases used in deployment dashboards.
     return (
         os.getenv("GEMINI_API_KEY")
         or os.getenv("GEMINY_API_KEY")
@@ -34,13 +43,20 @@ def get_gemini_api_key() -> str:
     ).strip()
 
 
+def get_gemini_model_name() -> str:
+    configured = (os.getenv("GEMINI_MODEL") or os.getenv("GEMINY_MODEL") or DEFAULT_GEMINI_MODEL).strip()
+    if configured in PRO_MODEL_ALIASES or configured.endswith("-pro"):
+        return DEFAULT_GEMINI_MODEL
+    return configured or DEFAULT_GEMINI_MODEL
+
+
 def gemini_available() -> bool:
     return bool(get_gemini_api_key())
 
 
 def get_model():
     genai.configure(api_key=get_gemini_api_key())
-    return genai.GenerativeModel(os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))
+    return genai.GenerativeModel(get_gemini_model_name())
 
 
 def parse_json_object(text: str, fallback: Dict[str, Any]) -> Dict[str, Any]:
