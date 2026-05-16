@@ -16,7 +16,9 @@ def _price(ticker,atype):
     try:
         if atype=="stock": return float(yf.Ticker(ticker).info.get("regularMarketPrice",0))
         return float(ccxt.binance().fetch_ticker(f"{ticker}/USDT").get("last",0))
-    except: return 0.0
+    except Exception as e:
+        print(f"[Resolver] price fetch failed for {ticker}: {e}")
+        return 0.0
 
 async def resolve_one(s):
     ticker=s.get("ticker",""); atype=s.get("asset_type","stock"); tf=s.get("timeframe","swing")
