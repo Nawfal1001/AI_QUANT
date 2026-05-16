@@ -43,6 +43,13 @@ export const statusColor = (value, good = 0, warn = -3, bad = -8) => {
   return tokens.danger
 }
 
+// Returns green for positive, red for negative, muted for zero/invalid
+export const signColor = (value) => {
+  const n = Number(value)
+  if (!Number.isFinite(n) || n === 0) return tokens.textMuted
+  return n > 0 ? tokens.success : tokens.danger
+}
+
 // Format currency
 export const fmt$ = (v, opts = {}) => {
   if (v == null || isNaN(v)) return '—'
