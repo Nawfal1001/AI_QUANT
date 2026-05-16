@@ -1,11 +1,13 @@
 import React, { useState, useEffect } from 'react'
-import { api } from '@/store/auth'
+import { api, useAuthStore } from '@/store/auth'
 import { Bot, Play, Square, RefreshCw, TrendingUp, TrendingDown } from 'lucide-react'
 import toast from 'react-hot-toast'
 const card = { background: '#161b22', border: '1px solid #21262d', borderRadius: 12, padding: '16px 18px' }
 const sig_color = (s) => s?.includes('BUY') ? '#3fb950' : s?.includes('SELL') ? '#f85149' : '#8b949e'
 
 export default function AutoTrader() {
+  const { user } = useAuthStore()
+  const isAdmin = user?.role === 'admin'
   const [config, setConfig]   = useState(null)
   const [stats,  setStats]    = useState(null)
   const [trades, setTrades]   = useState([])
@@ -26,17 +28,34 @@ export default function AutoTrader() {
 
   async function toggle() {
     if (!config) return
+    if (!isAdmin) { toast.error('Auto-trader config is admin-only'); return }
     const enabled = !config.enabled
-    await api.patch('/autotrader/config', { enabled })
-    if (enabled) await api.post('/autotrader/start'); else await api.post('/autotrader/stop')
-    setConfig(c => ({ ...c, enabled })); toast.success(enabled ? '🤖 Auto-trader started' : '⏹ Auto-trader stopped')
+    try {
+      await api.patch('/autotrader/config', { enabled })
+      if (enabled) await api.post('/autotrader/start'); else await api.post('/autotrader/stop')
+      setConfig(c => ({ ...c, enabled }))
+      toast.success(enabled ? '🤖 Auto-trader started' : '⏹ Auto-trader stopped')
+    } catch (e) { toast.error(e?.response?.data?.detail || 'Failed') }
   }
   async function scanNow() {
-    setLoading(true); try { const r = await api.post('/autotrader/scan-now'); toast.success(`Scanned — ${r.data.executed} trades executed`) } catch (e) { console.warn("caught:", e) } setLoading(false)
+    if (!isAdmin) { toast.error('Scan is admin-only'); return }
+    setLoading(true)
+    try {
+      const r = await api.post('/autotrader/scan-now')
+      toast.success(`Scanned — ${r.data.executed} trades executed`)
+    } catch (e) { toast.error(e?.response?.data?.detail || 'Failed') }
+    setLoading(false)
   }
   async function updateConfig(key, value) {
+    if (!isAdmin) { toast.error('Auto-trader config is admin-only'); return }
+    const prev = config
     setConfig(c => ({ ...c, [key]: value }))
-    await api.patch('/autotrader/config', { [key]: value })
+    try {
+      await api.patch('/autotrader/config', { [key]: value })
+    } catch (e) {
+      setConfig(prev)
+      toast.error(e?.response?.data?.detail || 'Failed')
+    }
   }
 
   const TABS = ['config', 'open trades', 'history', 'stats']
@@ -57,6 +76,12 @@ export default function AutoTrader() {
           )}
         </div>
       </div>
+
+      {!isAdmin && (
+        <div style={{ ...card, padding: '10px 14px', marginBottom: 14, borderColor: '#3a2f00', background: 'rgba(227,179,65,0.06)', color: '#e3b341', fontSize: 12 }}>
+          The auto-trader config and scan controls touch a shared global doc, so they're admin-only. You can still view stats, open trades, and history.
+        </div>
+      )}
 
       {/* Stats bar */}
       {stats && (

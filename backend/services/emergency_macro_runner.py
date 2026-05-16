@@ -98,6 +98,10 @@ async def _runner_loop():
     log.info("emergency_macro_runner started")
     while _running:
         try:
+            from services.runtime_controls import is_emergency_macro_enabled
+            if not await is_emergency_macro_enabled():
+                await asyncio.sleep(10)
+                continue
             now = datetime.utcnow().isoformat()
             signals = await db["macro_emergency_signals"].find({
                 "expires_at": {"$gte": now},

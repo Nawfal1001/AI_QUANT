@@ -8,12 +8,12 @@ Every live broker order flows through:
 4. Optional frontend/request live confirmation
 5. Adapter.place_order() — the real broker call
 """
-import base64
 from datetime import datetime
 
 from database import db
 from services import risk_engine, order_idempotency, data_freshness
 from services.brokers import make_adapter, BrokerError
+from services.credential_crypto import decrypt_secret
 from services.logger import child
 from services.runtime_controls import get_runtime_controls, is_live_trading_effectively_enabled
 
@@ -24,12 +24,9 @@ col_live_orders = db["live_orders"]
 
 
 def _reveal(s: str) -> str:
-    if not s:
-        return ""
-    try:
-        return base64.b64decode(s.encode()).decode()
-    except Exception:
-        return ""
+    """Decrypt a stored credential. decrypt_secret already handles both the new
+    fernet: tokens and legacy Base64 values, so existing connections keep working."""
+    return decrypt_secret(s) if s else ""
 
 
 async def get_broker_connection(user_id: str, broker_id: str):
