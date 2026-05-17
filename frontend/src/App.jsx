@@ -24,6 +24,7 @@ import StrategyLab from '@/pages/StrategyLab'
 import Bots from '@/pages/Bots'
 import Calendar from '@/pages/Calendar'
 import Logs from '@/pages/Logs'
+import Diagnostics from '@/pages/Diagnostics'
 
 export default function App() {
   const { validateToken, booting, booted } = useAuthStore()
@@ -65,6 +66,7 @@ export default function App() {
             <Route path="bots"       element={<Bots />} />
             <Route path="calendar"   element={<Calendar />} />
             <Route path="logs"       element={<Logs />} />
+            <Route path="diagnostics" element={<Diagnostics />} />
           </Route>
           <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Routes>
