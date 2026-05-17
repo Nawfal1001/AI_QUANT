@@ -21,6 +21,7 @@ cryptography==43.0.1
 websockets==12.0
 hmmlearn==0.3.2
 aiohttp==3.9.5
+optuna==3.6.1
 pytest==8.2.2
 pytest-asyncio==0.23.7
 mongomock-motor==0.0.34
