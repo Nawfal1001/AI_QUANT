@@ -22,108 +22,78 @@ Think like a professional desk analyst:
 - Never pretend to have live data unless the provided input includes it.
 """.strip()
 
-DEFAULT_GEMINI_MODEL = "gemini-1.5-flash"
-PRO_MODEL_ALIASES = {
-    "gemini-pro",
-    "gemini-1.0-pro",
-    "gemini-1.5-pro",
-    "models/gemini-pro",
-    "models/gemini-1.0-pro",
-    "models/gemini-1.5-pro",
-}
-
+DEFAULT_GEMINI_MODEL = "gemini-1.5-flash-latest"
+SAFE_FALLBACK_MODELS = ["gemini-1.5-flash-latest", "gemini-1.5-flash-002", "gemini-1.5-flash", "gemini-1.0-pro"]
+PRO_MODEL_ALIASES = {"gemini-pro", "gemini-1.0-pro", "gemini-1.5-pro", "models/gemini-pro", "models/gemini-1.0-pro", "models/gemini-1.5-pro"}
 
 def get_gemini_api_key() -> str:
-    """Read the Gemini API key from any of the common env-var aliases.
+    return (os.getenv("GEMINI_API_KEY") or os.getenv("GEMINY_API_KEY") or os.getenv("GOOGLE_API_KEY") or os.getenv("GOOGLE_GEMINI_API_KEY") or "").strip()
 
-    Operators often set GEMINY_API_KEY (typo), GOOGLE_API_KEY, or
-    GOOGLE_GEMINI_API_KEY — every path here must use this helper, not raw
-    os.getenv, or AI silently falls back to rules without warning.
-    """
-    return (
-        os.getenv("GEMINI_API_KEY")
-        or os.getenv("GEMINY_API_KEY")
-        or os.getenv("GOOGLE_API_KEY")
-        or os.getenv("GOOGLE_GEMINI_API_KEY")
-        or ""
-    ).strip()
-
+def _clean_model_name(name: str) -> str:
+    name=(name or "").strip()
+    if name.startswith("models/"): name=name.split("/",1)[1]
+    if name in PRO_MODEL_ALIASES or name.endswith("-pro"): return DEFAULT_GEMINI_MODEL
+    if name in {"gemini-1.5-flash", "models/gemini-1.5-flash"}: return DEFAULT_GEMINI_MODEL
+    return name or DEFAULT_GEMINI_MODEL
 
 def get_gemini_model_name() -> str:
-    """Resolve the model name. Pro aliases fall through to Flash so a stale
-    GEMINI_MODEL=gemini-1.5-pro (which usually requires a billing-enabled
-    project) doesn't break free-tier deployments."""
-    configured = (os.getenv("GEMINI_MODEL") or os.getenv("GEMINY_MODEL") or DEFAULT_GEMINI_MODEL).strip()
-    if configured in PRO_MODEL_ALIASES or configured.endswith("-pro"):
-        return DEFAULT_GEMINI_MODEL
-    return configured or DEFAULT_GEMINI_MODEL
+    return _clean_model_name(os.getenv("GEMINI_MODEL") or os.getenv("GEMINY_MODEL") or DEFAULT_GEMINI_MODEL)
 
-
-# Back-compat alias used by services added in this branch.
 def get_model_name() -> str:
     return get_gemini_model_name()
-
 
 def gemini_available() -> bool:
     return bool(get_gemini_api_key())
 
-
-def get_model():
+def get_model(model_name: str | None = None):
     genai.configure(api_key=get_gemini_api_key())
-    return genai.GenerativeModel(get_gemini_model_name())
+    return genai.GenerativeModel(_clean_model_name(model_name or get_gemini_model_name()))
 
+def _is_model_not_found(err: Exception) -> bool:
+    s=str(err).lower()
+    return "404" in s or "not found" in s or "not supported for generatecontent" in s
+
+def generate_content(prompt: str):
+    """Generate with configured model, then safe fallbacks.
+    Prevents stale GEMINI_MODEL=gemini-1.5-flash from breaking the app.
+    """
+    tried=[]
+    first=get_gemini_model_name()
+    for name in [first]+[m for m in SAFE_FALLBACK_MODELS if m!=first]:
+        tried.append(name)
+        try:
+            return get_model(name).generate_content(prompt)
+        except Exception as e:
+            if not _is_model_not_found(e) or name==SAFE_FALLBACK_MODELS[-1]:
+                raise
+            continue
 
 def ping() -> Dict[str, Any]:
-    """Quick health check that exercises the API key + model. Used by /api/ai/status.
-
-    Returns {available: bool, model: str, reason: str, latency_ms: int, key_source: str}.
-    """
     import time
-    out = {"available": False, "model": get_gemini_model_name(), "reason": "", "latency_ms": 0, "key_source": ""}
-    key = get_gemini_api_key()
+    out={"available":False,"model":get_gemini_model_name(),"reason":"","latency_ms":0,"key_source":""}
+    key=get_gemini_api_key()
     if not key:
-        out["reason"] = "GEMINI_API_KEY (or GEMINY_API_KEY / GOOGLE_API_KEY / GOOGLE_GEMINI_API_KEY) is not set"
-        return out
-    # Report which env var the key came from (without leaking the key itself).
-    for name in ("GEMINI_API_KEY", "GEMINY_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GEMINI_API_KEY"):
-        if os.getenv(name, "").strip() == key:
-            out["key_source"] = name
-            break
+        out["reason"]="GEMINI_API_KEY (or GEMINY_API_KEY / GOOGLE_API_KEY / GOOGLE_GEMINI_API_KEY) is not set"; return out
+    for name in ("GEMINI_API_KEY","GEMINY_API_KEY","GOOGLE_API_KEY","GOOGLE_GEMINI_API_KEY"):
+        if os.getenv(name,"").strip()==key: out["key_source"]=name; break
     try:
-        t0 = time.time()
-        model = get_model()
-        resp = model.generate_content('Reply with the JSON: {"ok":true}')
-        out["latency_ms"] = int((time.time() - t0) * 1000)
-        text = (resp.text or "").strip()
-        out["available"] = "ok" in text.lower() or "true" in text.lower()
-        out["reason"] = "Connected" if out["available"] else f"Unexpected response: {text[:120]}"
-        return out
+        t0=time.time(); resp=generate_content('Reply with the JSON: {"ok":true}'); out["latency_ms"]=int((time.time()-t0)*1000)
+        text=(resp.text or "").strip(); out["available"]="ok" in text.lower() or "true" in text.lower(); out["reason"]="Connected" if out["available"] else f"Unexpected response: {text[:120]}"; out["model"]=get_gemini_model_name(); return out
     except Exception as e:
-        out["reason"] = f"Gemini API error: {str(e)[:200]}"
-        return out
-
+        out["reason"]=f"Gemini API error: {str(e)[:200]}"; return out
 
 def parse_json_object(text: str, fallback: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-    match = re.search(r"\{.*\}", text or "", re.S)
-    if not match:
-        return dict(fallback)
-    try:
-        return json.loads(match.group())
-    except Exception:
-        return dict(fallback)
-
+    try: return json.loads(text)
+    except Exception: pass
+    match=re.search(r"\{.*\}", text or "", re.S)
+    if not match: return dict(fallback)
+    try: return json.loads(match.group())
+    except Exception: return dict(fallback)
 
 def clamp_number(value: Any, low: float, high: float, default: float) -> float:
-    try:
-        v = float(value)
-    except Exception:
-        v = default
-    return max(low, min(high, v))
-
+    try: v=float(value)
+    except Exception: v=default
+    return max(low,min(high,v))
 
 def json_only_guardrails(task: str, schema: str, rules: str = "") -> str:
     return f"""
@@ -146,7 +116,6 @@ Required JSON schema:
 Additional task rules:
 {rules}
 """.strip()
-
 
 def research_guardrails(task: str) -> str:
     return f"""
