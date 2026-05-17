@@ -22,9 +22,10 @@ Think like a professional desk analyst:
 - Never pretend to have live data unless the provided input includes it.
 """.strip()
 
-DEFAULT_GEMINI_MODEL = "gemini-1.5-flash-latest"
-SAFE_FALLBACK_MODELS = ["gemini-1.5-flash-latest", "gemini-1.5-flash-002", "gemini-1.5-flash", "gemini-1.0-pro"]
+DEFAULT_GEMINI_MODEL = "gemini-1.5-flash"
+SAFE_FALLBACK_MODELS = ["gemini-1.5-flash", "gemini-1.5-flash-002", "gemini-1.0-pro"]
 PRO_MODEL_ALIASES = {"gemini-pro", "gemini-1.0-pro", "gemini-1.5-pro", "models/gemini-pro", "models/gemini-1.0-pro", "models/gemini-1.5-pro"}
+BAD_MODEL_ALIASES = {"gemini-1.5-flash-latest", "models/gemini-1.5-flash-latest", "gemini-flash-latest", "models/gemini-flash-latest"}
 
 def get_gemini_api_key() -> str:
     return (os.getenv("GEMINI_API_KEY") or os.getenv("GEMINY_API_KEY") or os.getenv("GOOGLE_API_KEY") or os.getenv("GOOGLE_GEMINI_API_KEY") or "").strip()
@@ -32,8 +33,8 @@ def get_gemini_api_key() -> str:
 def _clean_model_name(name: str) -> str:
     name=(name or "").strip()
     if name.startswith("models/"): name=name.split("/",1)[1]
+    if name in BAD_MODEL_ALIASES: return DEFAULT_GEMINI_MODEL
     if name in PRO_MODEL_ALIASES or name.endswith("-pro"): return DEFAULT_GEMINI_MODEL
-    if name in {"gemini-1.5-flash", "models/gemini-1.5-flash"}: return DEFAULT_GEMINI_MODEL
     return name or DEFAULT_GEMINI_MODEL
 
 def get_gemini_model_name() -> str:
@@ -54,9 +55,6 @@ def _is_model_not_found(err: Exception) -> bool:
     return "404" in s or "not found" in s or "not supported for generatecontent" in s
 
 def generate_content(prompt: str):
-    """Generate with configured model, then safe fallbacks.
-    Prevents stale GEMINI_MODEL=gemini-1.5-flash from breaking the app.
-    """
     tried=[]
     first=get_gemini_model_name()
     for name in [first]+[m for m in SAFE_FALLBACK_MODELS if m!=first]:
