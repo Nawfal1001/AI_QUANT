@@ -47,6 +47,8 @@ HIGH_KEYWORDS = {
     "inventories": "OIL",
 }
 
+CALENDAR_HTTP_TIMEOUT = float(os.getenv("CALENDAR_HTTP_TIMEOUT", "30"))
+
 
 def _provider() -> str:
     return os.getenv("ECONOMIC_CALENDAR_PROVIDER", "finnhub").lower()
@@ -115,7 +117,7 @@ async def fetch_finnhub_calendar(start_date: str, end_date: str) -> List[Dict[st
     if not key:
         raise RuntimeError("FINNHUB_API_KEY is not configured")
     params = {"from": start_date, "to": end_date, "token": key}
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=CALENDAR_HTTP_TIMEOUT) as client:
         r = await client.get("https://finnhub.io/api/v1/calendar/economic", params=params)
         r.raise_for_status()
         data = r.json()
