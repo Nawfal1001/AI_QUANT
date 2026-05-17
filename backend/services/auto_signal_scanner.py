@@ -1,6 +1,6 @@
 """
 Automatic Universe Signal Scanner with diagnostic output.
-Scans all configured brokers and execution modes: paper for paper/sandbox, live when live mode is enabled.
+Auto-infers broker asset coverage without requiring AUTO_SIGNAL_ASSET_TYPES_* env vars.
 """
 from __future__ import annotations
 import asyncio, os
@@ -16,7 +16,7 @@ except Exception:
     log_event = None
 log=child("auto_signal_scanner"); col_auto_signals=db["auto_signals"]; col_auto_signal_runs=db["auto_signal_runs"]
 _TASK=None; _RUNNING=False
-FUSION_ASSET_TYPES=["stock","forex","crypto"]; BROKER_MULTI_ASSETS={"fusion":FUSION_ASSET_TYPES,"paper":["crypto","stock","forex"]}
+BROKER_CAPABILITIES={"paper":["crypto","stock","forex"],"fusion":["stock","forex","crypto"],"alpaca":["stock","crypto"],"interactive_brokers":["stock","forex","crypto"],"ibkr":["stock","forex","crypto"],"tradestation":["stock","crypto"],"schwab":["stock"],"robinhood":["stock","crypto"],"webull":["stock","crypto"],"fidelity":["stock"],"etrade":["stock"],"binance":["crypto"],"binanceus":["crypto"],"kucoin":["crypto"],"coinbase":["crypto"],"kraken":["crypto"],"bybit":["crypto"],"okx":["crypto"],"bitget":["crypto"],"oanda":["forex"],"fxcm":["forex"],"forexcom":["forex"]}
 PAPER_ALIASES={"paper","fusion","sandbox","demo"}
 def _env_bool(name,default=False):
     raw=os.getenv(name)
@@ -30,11 +30,9 @@ async def _alog(scope,message,level="info",data=None):
 def _execution_mode_for_broker(broker):
     b=normalize_broker_id(broker)
     if b in PAPER_ALIASES: return "paper"
-    live=_env_bool("LIVE_TRADING_ENABLED",False)
-    return "live" if live else "paper"
+    return "live" if _env_bool("LIVE_TRADING_ENABLED",False) else "paper"
 async def _configured_brokers():
-    explicit=_csv_env("AUTO_SIGNAL_BROKERS")
-    out=[normalize_broker_id(x) for x in explicit if x] if explicit else []
+    explicit=_csv_env("AUTO_SIGNAL_BROKERS"); out=[normalize_broker_id(x) for x in explicit if x] if explicit else []
     if not out:
         for coll,field in [("brokers","broker_id"),("bots","broker")]:
             try:
@@ -42,7 +40,6 @@ async def _configured_brokers():
                     nb=normalize_broker_id(x)
                     if nb and nb not in out: out.append(nb)
             except Exception: pass
-    # Include available env-driven broker connections.
     if _env_bool("BINANCE_ENABLED",False) or os.getenv("BINANCE_API_KEY") or os.getenv("BINANCE_SECRET_KEY"):
         if "binance" not in out: out.append("binance")
     if os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID"):
@@ -53,14 +50,12 @@ async def _configured_brokers():
     if "paper" not in out: out.insert(0,"paper")
     return out
 def _asset_types_for_broker(broker):
-    broker=normalize_broker_id(broker); raw=_csv_env(f"AUTO_SIGNAL_ASSET_TYPES_{broker.upper()}")
-    if broker=="fusion": raw=raw or _csv_env("FUSION_ASSET_TYPES") or FUSION_ASSET_TYPES
-    if raw: return [x.lower() for x in raw]
-    if broker in BROKER_MULTI_ASSETS: return BROKER_MULTI_ASSETS[broker]
-    return [infer_asset_type_for_broker(broker)]
+    broker=normalize_broker_id(broker)
+    explicit=_csv_env(f"AUTO_SIGNAL_ASSET_TYPES_{broker.upper()}")
+    if explicit: return [x.lower() for x in explicit]
+    return BROKER_CAPABILITIES.get(broker,[infer_asset_type_for_broker(broker)])
 def _signal_direction(signal):
-    s=str(signal or "HOLD").upper()
-    return "BUY" if "BUY" in s else "SELL" if "SELL" in s else "HOLD"
+    s=str(signal or "HOLD").upper(); return "BUY" if "BUY" in s else "SELL" if "SELL" in s else "HOLD"
 def _filter_reason(x,min_confidence):
     if x.get("error"): return "provider_or_signal_error"
     if x.get("direction")=="HOLD": return "hold_signal"
@@ -81,8 +76,7 @@ async def scan_auto_signals(broker_id="paper",asset_type=None,timeframe="swing",
             sig.update({"broker":broker,"execution_mode":execution_mode,"scanner_score":candidate.get("score"),"scanner_reason":candidate.get("reason"),"auto_signal":True,"created_at":datetime.utcnow().isoformat(),"direction":_signal_direction(sig.get("signal"))})
         except Exception as e:
             sig={"ticker":ticker,"asset_type":asset,"broker":broker,"execution_mode":execution_mode,"signal":"HOLD","confidence":0,"error":str(e),"created_at":datetime.utcnow().isoformat(),"direction":"HOLD","scanner_score":candidate.get("score"),"scanner_reason":candidate.get("reason")}
-        sig["is_actionable"]=sig.get("direction") in {"BUY","SELL"} and float(sig.get("confidence",0) or 0)>=float(min_confidence)
-        sig["filter_reason"]=_filter_reason(sig,min_confidence); generated.append(sig)
+        sig["is_actionable"]=sig.get("direction") in {"BUY","SELL"} and float(sig.get("confidence",0) or 0)>=float(min_confidence); sig["filter_reason"]=_filter_reason(sig,min_confidence); generated.append(sig)
         await _alog("signals",f"{broker}/{execution_mode}/{asset} {ticker}: {sig.get('signal')} conf={sig.get('confidence')} reason={sig.get('filter_reason')}","success" if sig["is_actionable"] else "info",{"ticker":ticker,"broker":broker,"mode":execution_mode,"asset_type":asset,"signal":sig.get("signal"),"confidence":sig.get("confidence"),"reason":sig.get("filter_reason")})
     actionable=[x for x in generated if x.get("is_actionable")]; actionable.sort(key=lambda x:(float(x.get("confidence",0) or 0),float(x.get("scanner_score",0) or 0)),reverse=True)
     diagnostics=sorted(generated,key=lambda x:(1 if x.get("is_actionable") else 0,float(x.get("confidence",0) or 0),float(x.get("scanner_score",0) or 0)),reverse=True)[:signal_limit]
