@@ -1,9 +1,7 @@
 """
-TradeAI Signal Service v4.4
-18 indicators + Kalman/FRAMA/Hilbert/AdaptiveRSI/Entropy/OFI
-+ Meta-Learner boost + Confluence Memory + LLM Sentiment + Volume Profile + Microstructure
-+ Bayesian voting (regime-conditional)
-+ Shared market-data fetcher with Yahoo/Alpha Vantage fallback for stocks.
+TradeAI Signal Service v4.5
+Adds confidence calibration, richer signal quality diagnostics, and extra indicators:
+CCI, Williams %R, MFI, Donchian breakout, Keltner channel, Choppiness, ROC.
 """
 import asyncio, numpy as np, pandas as pd, ta
 from datetime import datetime, timedelta
@@ -14,152 +12,141 @@ from services.advanced_indicators import calc_kalman_signal,calc_frama,calc_hilb
 from services.bayesian_engine import bayesian_vote
 from services.logger import child as _child_log
 _log = _child_log('signal_service')
-TF = {"scalping":{"period":50,"days":90,"interval":"1d","atr":14,"sl":0.5,"tp":1.0},"intraday":{"period":100,"days":180,"interval":"1d","atr":14,"sl":1.0,"tp":2.0},"swing":{"period":200,"days":365,"interval":"1d","atr":14,"sl":1.5,"tp":3.0},"position":{"period":300,"days":730,"interval":"1d","atr":14,"sl":2.0,"tp":4.0}}
-
-def _normalize_df(df, period):
-    if df is None or len(df) == 0: return pd.DataFrame()
-    out = df.copy()
-    lower = {c: str(c).lower() for c in out.columns}
-    out = out.rename(columns=lower)
-    needed = ["open","high","low","close","volume"]
+TF={"scalping":{"period":80,"days":90,"interval":"1d","atr":14,"sl":0.5,"tp":1.0},"intraday":{"period":120,"days":180,"interval":"1d","atr":14,"sl":1.0,"tp":2.0},"swing":{"period":220,"days":365,"interval":"1d","atr":14,"sl":1.5,"tp":3.0},"position":{"period":320,"days":730,"interval":"1d","atr":14,"sl":2.0,"tp":4.0}}
+def _normalize_df(df,period):
+    if df is None or len(df)==0: return pd.DataFrame()
+    out=df.copy(); out=out.rename(columns={c:str(c).lower() for c in out.columns}); needed=["open","high","low","close","volume"]
     if not all(c in out.columns for c in needed): return pd.DataFrame()
-    out = out[needed].apply(pd.to_numeric, errors="coerce").dropna()
-    return out.tail(period)
-
-def _fetch(ticker, atype, period, days=365, interval="1d"):
+    return out[needed].apply(pd.to_numeric,errors="coerce").dropna().tail(period)
+def _fetch(ticker,atype,period,days=365,interval="1d"):
     try:
         from services.backtest_engine import fetch_history
-        end = datetime.utcnow()
-        start = end - timedelta(days=days)
-        loop = asyncio.new_event_loop()
+        end=datetime.utcnow(); start=end-timedelta(days=days); loop=asyncio.new_event_loop()
         try:
-            asyncio.set_event_loop(loop)
-            df = loop.run_until_complete(fetch_history(ticker, atype, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), interval))
+            asyncio.set_event_loop(loop); df=loop.run_until_complete(fetch_history(ticker,atype,start.strftime("%Y-%m-%d"),end.strftime("%Y-%m-%d"),interval))
         finally:
-            loop.close()
-            asyncio.set_event_loop(None)
-        return _normalize_df(df, period)
-    except Exception as e:
-        _log.warning(f"shared fetch failed for {ticker} ({atype}): {e}")
-        return pd.DataFrame()
-
+            loop.close(); asyncio.set_event_loop(None)
+        return _normalize_df(df,period)
+    except Exception as e: _log.warning(f"shared fetch failed for {ticker} ({atype}): {e}"); return pd.DataFrame()
+def _ind(name,val,signal,score,reason,**extra):
+    return {"indicator":name,"value":val,"signal":signal,"score":score,"reason":reason,**extra}
 def rsi(c):
     try:
-        v=float(ta.momentum.RSIIndicator(c,14).rsi().dropna().iloc[-1])
-        if v<30: s=+2; r=f"Oversold ({v:.1f})"
-        elif v<45: s=+1; r=f"Low ({v:.1f})"
-        elif v>70: s=-2; r=f"Overbought ({v:.1f})"
-        elif v>55: s=-1; r=f"High ({v:.1f})"
-        else: s=0; r=f"Neutral ({v:.1f})"
-        return {"indicator":"RSI","value":round(v,2),"signal":"BUY" if s>0 else "SELL" if s<0 else "NEUTRAL","score":s,"reason":r}
-    except: return {"indicator":"RSI","value":50,"signal":"NEUTRAL","score":0,"reason":"Error"}
+        v=float(ta.momentum.RSIIndicator(c,14).rsi().dropna().iloc[-1]); s=2 if v<30 else 1 if v<45 else -2 if v>70 else -1 if v>55 else 0; r=f"RSI {v:.1f}"
+        return _ind("RSI",round(v,2),"BUY" if s>0 else "SELL" if s<0 else "NEUTRAL",s,r)
+    except: return _ind("RSI",50,"NEUTRAL",0,"Error")
 def macd(c):
     try:
-        m=ta.trend.MACD(c); mv=float(m.macd().dropna().iloc[-1]); sv=float(m.macd_signal().dropna().iloc[-1]); hv=float(m.macd_diff().dropna().iloc[-1])
-        if mv>sv and hv>0: s,r=+2,"Bullish crossover"
-        elif mv<sv and hv<0: s,r=-2,"Bearish crossover"
-        elif mv>sv: s,r=+1,"MACD above signal"
-        else: s,r=-1,"MACD below signal"
-        return {"indicator":"MACD","value":round(mv,4),"signal":"BUY" if s>0 else "SELL","score":s,"reason":r}
-    except: return {"indicator":"MACD","value":0,"signal":"NEUTRAL","score":0,"reason":"Error"}
+        m=ta.trend.MACD(c); mv=float(m.macd().dropna().iloc[-1]); sv=float(m.macd_signal().dropna().iloc[-1]); hv=float(m.macd_diff().dropna().iloc[-1]); s=2 if mv>sv and hv>0 else -2 if mv<sv and hv<0 else 1 if mv>sv else -1
+        return _ind("MACD",round(mv,4),"BUY" if s>0 else "SELL",s,"Bullish" if s>0 else "Bearish")
+    except: return _ind("MACD",0,"NEUTRAL",0,"Error")
 def ema(c):
     try:
-        e9=float(ta.trend.EMAIndicator(c,9).ema_indicator().dropna().iloc[-1]); e21=float(ta.trend.EMAIndicator(c,21).ema_indicator().dropna().iloc[-1]); e50=float(ta.trend.EMAIndicator(c,50).ema_indicator().dropna().iloc[-1]); price=float(c.iloc[-1])
-        if e9>e21>e50 and price>e9: s,r=+2,"Bullish stack 9>21>50"
-        elif e9<e21<e50 and price<e9: s,r=-2,"Bearish stack 9<21<50"
-        elif e9>e21: s,r=+1,"EMA 9>21"
-        else: s,r=-1,"EMA 9<21"
-        return {"indicator":"EMA_CROSS","value":round(e9,4),"signal":"BUY" if s>0 else "SELL","score":s,"reason":r}
-    except: return {"indicator":"EMA_CROSS","value":0,"signal":"NEUTRAL","score":0,"reason":"Error"}
+        e9=float(ta.trend.EMAIndicator(c,9).ema_indicator().dropna().iloc[-1]); e21=float(ta.trend.EMAIndicator(c,21).ema_indicator().dropna().iloc[-1]); e50=float(ta.trend.EMAIndicator(c,50).ema_indicator().dropna().iloc[-1]); price=float(c.iloc[-1]); s=2 if e9>e21>e50 and price>e9 else -2 if e9<e21<e50 and price<e9 else 1 if e9>e21 else -1
+        return _ind("EMA_CROSS",round(e9,4),"BUY" if s>0 else "SELL",s,"EMA trend stack")
+    except: return _ind("EMA_CROSS",0,"NEUTRAL",0,"Error")
 def bollinger(c):
     try:
-        bb=ta.volatility.BollingerBands(c,20,2); price=float(c.iloc[-1]); upper=float(bb.bollinger_hband().dropna().iloc[-1]); lower=float(bb.bollinger_lband().dropna().iloc[-1]); mid=float(bb.bollinger_mavg().dropna().iloc[-1])
-        if price<=lower*1.01: s,r=+2,"At lower band"
-        elif price>=upper*0.99: s,r=-2,"At upper band"
-        elif price<mid: s,r=+1,"Below midband"
-        else: s,r=-1,"Above midband"
-        return {"indicator":"BOLLINGER","value":round(price,4),"signal":"BUY" if s>0 else "SELL","score":s,"reason":r}
-    except: return {"indicator":"BOLLINGER","value":0,"signal":"NEUTRAL","score":0,"reason":"Error"}
+        bb=ta.volatility.BollingerBands(c,20,2); price=float(c.iloc[-1]); upper=float(bb.bollinger_hband().dropna().iloc[-1]); lower=float(bb.bollinger_lband().dropna().iloc[-1]); mid=float(bb.bollinger_mavg().dropna().iloc[-1]); s=2 if price<=lower*1.01 else -2 if price>=upper*0.99 else 1 if price<mid else -1
+        return _ind("BOLLINGER",round(price,4),"BUY" if s>0 else "SELL",s,"Band location")
+    except: return _ind("BOLLINGER",0,"NEUTRAL",0,"Error")
 def stoch(h,l,c):
     try:
-        st=ta.momentum.StochasticOscillator(h,l,c,14,3); k=float(st.stoch().dropna().iloc[-1]); d=float(st.stoch_signal().dropna().iloc[-1])
-        if k<20 and k>d: s,r=+2,f"Oversold+cross ({k:.1f})"
-        elif k>80 and k<d: s,r=-2,f"Overbought+cross ({k:.1f})"
-        elif k<35: s,r=+1,f"Low ({k:.1f})"
-        elif k>65: s,r=-1,f"High ({k:.1f})"
-        else: s,r=0,f"Neutral ({k:.1f})"
-        return {"indicator":"STOCHASTIC","value":round(k,2),"signal":"BUY" if s>0 else "SELL" if s<0 else "NEUTRAL","score":s,"reason":r}
-    except: return {"indicator":"STOCHASTIC","value":50,"signal":"NEUTRAL","score":0,"reason":"Error"}
+        st=ta.momentum.StochasticOscillator(h,l,c,14,3); k=float(st.stoch().dropna().iloc[-1]); d=float(st.stoch_signal().dropna().iloc[-1]); s=2 if k<20 and k>d else -2 if k>80 and k<d else 1 if k<35 else -1 if k>65 else 0
+        return _ind("STOCHASTIC",round(k,2),"BUY" if s>0 else "SELL" if s<0 else "NEUTRAL",s,f"K={k:.1f}")
+    except: return _ind("STOCHASTIC",50,"NEUTRAL",0,"Error")
 def adx(h,l,c):
     try:
-        a=ta.trend.ADXIndicator(h,l,c,14); av=float(a.adx().dropna().iloc[-1]); dp=float(a.adx_pos().dropna().iloc[-1]); dm=float(a.adx_neg().dropna().iloc[-1])
-        if av>25 and dp>dm: s,r=+2,f"Strong uptrend ADX={av:.1f}"
-        elif av>25 and dp<dm: s,r=-2,f"Strong downtrend ADX={av:.1f}"
-        elif av>20 and dp>dm: s,r=+1,f"Moderate uptrend ADX={av:.1f}"
-        elif av>20: s,r=-1,f"Moderate downtrend ADX={av:.1f}"
-        else: s,r=0,f"No trend ADX={av:.1f}"
-        return {"indicator":"ADX","value":round(av,2),"signal":"BUY" if s>0 else "SELL" if s<0 else "NEUTRAL","score":s,"reason":r}
-    except: return {"indicator":"ADX","value":0,"signal":"NEUTRAL","score":0,"reason":"Error"}
+        a=ta.trend.ADXIndicator(h,l,c,14); av=float(a.adx().dropna().iloc[-1]); dp=float(a.adx_pos().dropna().iloc[-1]); dm=float(a.adx_neg().dropna().iloc[-1]); s=2 if av>25 and dp>dm else -2 if av>25 and dp<dm else 1 if av>20 and dp>dm else -1 if av>20 else 0
+        return _ind("ADX",round(av,2),"BUY" if s>0 else "SELL" if s<0 else "NEUTRAL",s,f"ADX={av:.1f}")
+    except: return _ind("ADX",0,"NEUTRAL",0,"Error")
 def vwap(h,l,c,v):
     try:
-        val=float(ta.volume.VolumeWeightedAveragePrice(h,l,c,v).volume_weighted_average_price().dropna().iloc[-1]); price=float(c.iloc[-1]); diff=round((price-val)/val*100,2)
-        if price>val*1.005: s,r=+2,f"Above VWAP +{diff}%"
-        elif price<val*0.995: s,r=-2,f"Below VWAP {diff}%"
-        else: s,r=0,f"Near VWAP {diff}%"
-        return {"indicator":"VWAP","value":round(val,4),"signal":"BUY" if s>0 else "SELL" if s<0 else "NEUTRAL","score":s,"reason":r}
-    except: return {"indicator":"VWAP","value":0,"signal":"NEUTRAL","score":0,"reason":"Error"}
+        val=float(ta.volume.VolumeWeightedAveragePrice(h,l,c,v).volume_weighted_average_price().dropna().iloc[-1]); price=float(c.iloc[-1]); diff=(price-val)/val*100; s=2 if price>val*1.005 else -2 if price<val*0.995 else 0
+        return _ind("VWAP",round(val,4),"BUY" if s>0 else "SELL" if s<0 else "NEUTRAL",s,f"VWAP diff {diff:.2f}%")
+    except: return _ind("VWAP",0,"NEUTRAL",0,"Error")
 def obv(c,v):
     try:
-        ob=ta.volume.OnBalanceVolumeIndicator(c,v).on_balance_volume(); oe=ob.ewm(span=20).mean()
-        if float(ob.iloc[-1])>float(oe.iloc[-1]): s,r=+2,"OBV accumulation"
-        else: s,r=-2,"OBV distribution"
-        return {"indicator":"OBV","value":round(float(ob.iloc[-1]),0),"signal":"BUY" if s>0 else "SELL","score":s,"reason":r}
-    except: return {"indicator":"OBV","value":0,"signal":"NEUTRAL","score":0,"reason":"Error"}
+        ob=ta.volume.OnBalanceVolumeIndicator(c,v).on_balance_volume(); oe=ob.ewm(span=20).mean(); s=2 if float(ob.iloc[-1])>float(oe.iloc[-1]) else -2
+        return _ind("OBV",round(float(ob.iloc[-1]),0),"BUY" if s>0 else "SELL",s,"Accumulation" if s>0 else "Distribution")
+    except: return _ind("OBV",0,"NEUTRAL",0,"Error")
 def supertrend(h,l,c):
     try:
-        atr=ta.volatility.AverageTrueRange(h,l,c,10).average_true_range(); hl2=(h+l)/2; lw=hl2-3*atr; price=float(c.iloc[-1]); lv=float(lw.dropna().iloc[-1])
-        if price>lv: s,r=+2,"SuperTrend bullish"
-        else: s,r=-2,"SuperTrend bearish"
-        return {"indicator":"SUPERTREND","value":round(lv,4),"signal":"BUY" if s>0 else "SELL","score":s,"reason":r}
-    except: return {"indicator":"SUPERTREND","value":0,"signal":"NEUTRAL","score":0,"reason":"Error"}
+        atr=ta.volatility.AverageTrueRange(h,l,c,10).average_true_range(); hl2=(h+l)/2; lw=hl2-3*atr; price=float(c.iloc[-1]); lv=float(lw.dropna().iloc[-1]); s=2 if price>lv else -2
+        return _ind("SUPERTREND",round(lv,4),"BUY" if s>0 else "SELL",s,"Supertrend direction")
+    except: return _ind("SUPERTREND",0,"NEUTRAL",0,"Error")
 def ichimoku(h,l,c):
     try:
-        ich=ta.trend.IchimokuIndicator(h,l); conv=float(ich.ichimoku_conversion_line().dropna().iloc[-1]); base=float(ich.ichimoku_base_line().dropna().iloc[-1]); price=float(c.iloc[-1])
-        if price>conv>base: s,r=+2,"Above Kumo bullish"
-        elif price<conv<base: s,r=-2,"Below Kumo bearish"
-        elif conv>base: s,r=+1,"Tenkan>Kijun"
-        else: s,r=-1,"Tenkan<Kijun"
-        return {"indicator":"ICHIMOKU","value":round(conv,4),"signal":"BUY" if s>0 else "SELL","score":s,"reason":r}
-    except: return {"indicator":"ICHIMOKU","value":0,"signal":"NEUTRAL","score":0,"reason":"Error"}
+        ich=ta.trend.IchimokuIndicator(h,l); conv=float(ich.ichimoku_conversion_line().dropna().iloc[-1]); base=float(ich.ichimoku_base_line().dropna().iloc[-1]); price=float(c.iloc[-1]); s=2 if price>conv>base else -2 if price<conv<base else 1 if conv>base else -1
+        return _ind("ICHIMOKU",round(conv,4),"BUY" if s>0 else "SELL",s,"Ichimoku alignment")
+    except: return _ind("ICHIMOKU",0,"NEUTRAL",0,"Error")
 def volume_sig(c,v):
     try:
-        avg=float(v.rolling(20).mean().dropna().iloc[-1]); curr=float(v.iloc[-1]); ratio=curr/avg if avg>0 else 1; pc=(float(c.iloc[-1])-float(c.iloc[-2]))/float(c.iloc[-2])*100
-        if ratio>2 and pc>0: s,r=+2,f"High vol breakout {ratio:.1f}x"
-        elif ratio>2 and pc<0: s,r=-2,f"High vol breakdown {ratio:.1f}x"
-        elif ratio>1.5: s,r=(+1 if pc>0 else -1),f"Above avg vol {ratio:.1f}x"
-        else: s,r=0,f"Normal vol {ratio:.1f}x"
-        return {"indicator":"VOLUME","value":round(ratio,2),"signal":"BUY" if s>0 else "SELL" if s<0 else "NEUTRAL","score":s,"reason":r}
-    except: return {"indicator":"VOLUME","value":1,"signal":"NEUTRAL","score":0,"reason":"Error"}
+        avg=float(v.rolling(20).mean().dropna().iloc[-1]); curr=float(v.iloc[-1]); ratio=curr/avg if avg>0 else 1; pc=(float(c.iloc[-1])-float(c.iloc[-2]))/float(c.iloc[-2])*100; s=2 if ratio>2 and pc>0 else -2 if ratio>2 and pc<0 else (1 if pc>0 else -1) if ratio>1.5 else 0
+        return _ind("VOLUME",round(ratio,2),"BUY" if s>0 else "SELL" if s<0 else "NEUTRAL",s,f"Volume {ratio:.1f}x")
+    except: return _ind("VOLUME",1,"NEUTRAL",0,"Error")
 def atr_vol(h,l,c):
     try:
-        atr=float(ta.volatility.AverageTrueRange(h,l,c,14).average_true_range().dropna().iloc[-1]); price=float(c.iloc[-1]); pct=atr/price*100
-        if pct>3: sig,r="ALERT",f"HIGH vol ATR={pct:.2f}%"
-        elif pct<0.5: sig,r="INFO",f"LOW vol ATR={pct:.2f}%"
-        else: sig,r="NEUTRAL",f"Normal ATR={pct:.2f}%"
-        return {"indicator":"ATR_VOLATILITY","value":round(pct,3),"signal":sig,"score":0,"reason":r,"atr_abs":round(atr,4)}
-    except: return {"indicator":"ATR_VOLATILITY","value":1,"signal":"NEUTRAL","score":0,"reason":"Error"}
-
-async def generate_signal(ticker, atype="stock", timeframe="swing", use_ai=False, use_advanced=True):
-    cfg=TF.get(timeframe,TF["swing"])
-    loop=asyncio.get_event_loop()
-    df=await loop.run_in_executor(None,partial(_fetch,ticker,atype,cfg["period"],cfg.get("days",365),cfg.get("interval","1d")))
-    if df.empty or len(df)<50:
-        return {"ticker":ticker,"asset_type":atype,"timeframe":timeframe,"signal":"HOLD","confidence":0,"error":f"Not enough candle data for {ticker} ({atype}). Received {len(df)} bars; need at least 50.","timestamp":datetime.utcnow().isoformat(),"indicators":[],"bayesian":{}}
-    c=df["close"]; h=df["high"]; l=df["low"]; v=df["volume"]; price=float(c.iloc[-1])
-    weights=await get_weights()
-    hilbert_data=calc_hilbert(c)
-    inds=[rsi(c),macd(c),ema(c),bollinger(c),stoch(h,l,c),adx(h,l,c),vwap(h,l,c,v),obv(c,v),supertrend(h,l,c),ichimoku(h,l,c),volume_sig(c,v),atr_vol(h,l,c),calc_kalman_signal(c),calc_frama(h,l,c),hilbert_data,calc_adaptive_rsi(c,hilbert_data.get("cycle_period",14)),calc_entropy(c),calc_ofi(df["open"],h,l,c,v)]
-    entropy_ok=next((i for i in inds if i["indicator"]=="ENTROPY"),{}).get("tradeable",True)
+        atr=float(ta.volatility.AverageTrueRange(h,l,c,14).average_true_range().dropna().iloc[-1]); price=float(c.iloc[-1]); pct=atr/price*100; sig="ALERT" if pct>3 else "INFO" if pct<0.5 else "NEUTRAL"
+        return _ind("ATR_VOLATILITY",round(pct,3),sig,0,f"ATR={pct:.2f}%",atr_abs=round(atr,4))
+    except: return _ind("ATR_VOLATILITY",1,"NEUTRAL",0,"Error")
+def cci(h,l,c):
+    try:
+        v=float(ta.trend.CCIIndicator(h,l,c,20).cci().dropna().iloc[-1]); s=2 if v<-150 else 1 if v<-80 else -2 if v>150 else -1 if v>80 else 0
+        return _ind("CCI",round(v,2),"BUY" if s>0 else "SELL" if s<0 else "NEUTRAL",s,f"CCI {v:.1f}")
+    except: return _ind("CCI",0,"NEUTRAL",0,"Error")
+def williams_r(h,l,c):
+    try:
+        v=float(ta.momentum.WilliamsRIndicator(h,l,c,14).williams_r().dropna().iloc[-1]); s=2 if v<-85 else 1 if v<-70 else -2 if v>-15 else -1 if v>-30 else 0
+        return _ind("WILLIAMS_R",round(v,2),"BUY" if s>0 else "SELL" if s<0 else "NEUTRAL",s,f"%R {v:.1f}")
+    except: return _ind("WILLIAMS_R",-50,"NEUTRAL",0,"Error")
+def mfi(h,l,c,v):
+    try:
+        val=float(ta.volume.MFIIndicator(h,l,c,v,14).money_flow_index().dropna().iloc[-1]); s=2 if val<20 else 1 if val<35 else -2 if val>80 else -1 if val>65 else 0
+        return _ind("MFI",round(val,2),"BUY" if s>0 else "SELL" if s<0 else "NEUTRAL",s,f"MFI {val:.1f}")
+    except: return _ind("MFI",50,"NEUTRAL",0,"Error")
+def donchian(h,l,c):
+    try:
+        hi=float(h.rolling(20).max().iloc[-2]); lo=float(l.rolling(20).min().iloc[-2]); price=float(c.iloc[-1]); s=2 if price>hi else -2 if price<lo else 0
+        return _ind("DONCHIAN_BREAKOUT",round(price,4),"BUY" if s>0 else "SELL" if s<0 else "NEUTRAL",s,"20-bar breakout" if s else "Inside channel")
+    except: return _ind("DONCHIAN_BREAKOUT",0,"NEUTRAL",0,"Error")
+def keltner(h,l,c):
+    try:
+        kc=ta.volatility.KeltnerChannel(h,l,c,20,10); price=float(c.iloc[-1]); up=float(kc.keltner_channel_hband().dropna().iloc[-1]); dn=float(kc.keltner_channel_lband().dropna().iloc[-1]); mid=float(kc.keltner_channel_mband().dropna().iloc[-1]); s=2 if price>up else -2 if price<dn else 1 if price>mid else -1
+        return _ind("KELTNER",round(price,4),"BUY" if s>0 else "SELL",s,"Keltner channel position")
+    except: return _ind("KELTNER",0,"NEUTRAL",0,"Error")
+def choppiness(h,l,c):
+    try:
+        tr=pd.concat([(h-l),(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1); n=14; chop=100*np.log10(tr.rolling(n).sum()/(h.rolling(n).max()-l.rolling(n).min()))/np.log10(n); val=float(chop.dropna().iloc[-1]); s=0; sig="NEUTRAL"
+        return _ind("CHOPPINESS",round(val,2),sig,s,"Trending" if val<38 else "Choppy" if val>61 else "Normal",tradeable=val<61)
+    except: return _ind("CHOPPINESS",50,"NEUTRAL",0,"Error",tradeable=True)
+def roc(c):
+    try:
+        val=float(ta.momentum.ROCIndicator(c,12).roc().dropna().iloc[-1]); s=2 if val>6 else 1 if val>1 else -2 if val<-6 else -1 if val<-1 else 0
+        return _ind("ROC",round(val,2),"BUY" if s>0 else "SELL" if s<0 else "NEUTRAL",s,f"ROC {val:.2f}%")
+    except: return _ind("ROC",0,"NEUTRAL",0,"Error")
+def _confidence_quality(inds, conf):
+    votes=[i for i in inds if abs(float(i.get("score",0) or 0))>0]
+    buy=sum(1 for i in votes if i.get("score",0)>0); sell=sum(1 for i in votes if i.get("score",0)<0); total=max(1,len(votes)); agreement=max(buy,sell)/total*100; conflict=min(buy,sell)/total*100
+    return {"vote_count":len(votes),"buy_votes":buy,"sell_votes":sell,"agreement_pct":round(agreement,2),"conflict_pct":round(conflict,2),"confidence_raw":conf,"confidence_note":"confidence is an estimate, calibrated by evidence and not a guaranteed win probability"}
+async def _calibrate_confidence(ticker,atype,timeframe,signal,conf,regime,quality):
+    calibrated=float(conf); details={"method":"vote_conflict_and_history","before":round(float(conf),2)}
+    if quality["vote_count"]<8: calibrated-=8; details["low_vote_penalty"]=-8
+    if quality["conflict_pct"]>35: p=min(18,(quality["conflict_pct"]-35)*0.7); calibrated-=p; details["conflict_penalty"]=-round(p,2)
+    if quality["agreement_pct"]>75 and conf>=55: calibrated+=4; details["agreement_boost"]=4
+    try:
+        q={"ticker":ticker.upper(),"asset_type":atype,"timeframe":timeframe,"regime":regime,"signal":signal,"resolved":True}
+        docs=await db["signal_outcomes"].find(q).sort("resolved_at",-1).limit(80).to_list(80)
+        if len(docs)>=10:
+            wins=sum(1 for d in docs if d.get("outcome")=="WIN" or float(d.get("pnl_pct",0) or 0)>0); wr=wins/len(docs)*100; adj=(wr-50)*0.25; calibrated+=adj; details.update({"samples":len(docs),"historical_win_rate":round(wr,2),"history_adjustment":round(adj,2)})
+    except Exception as e: details["history_error"]=str(e)
+    calibrated=max(0,min(100,calibrated)); details["after"]=round(calibrated,2); return int(round(calibrated)),details
+async def generate_signal(ticker,atype="stock",timeframe="swing",use_ai=False,use_advanced=True):
+    cfg=TF.get(timeframe,TF["swing"]); loop=asyncio.get_event_loop(); df=await loop.run_in_executor(None,partial(_fetch,ticker,atype,cfg["period"],cfg.get("days",365),cfg.get("interval","1d")))
+    if df.empty or len(df)<50: return {"ticker":ticker,"asset_type":atype,"timeframe":timeframe,"signal":"HOLD","confidence":0,"error":f"Not enough candle data for {ticker} ({atype}). Received {len(df)} bars; need at least 50.","timestamp":datetime.utcnow().isoformat(),"indicators":[],"bayesian":{}}
+    c=df["close"]; h=df["high"]; l=df["low"]; v=df["volume"]; price=float(c.iloc[-1]); weights=await get_weights(); hilbert_data=calc_hilbert(c)
+    inds=[rsi(c),macd(c),ema(c),bollinger(c),stoch(h,l,c),adx(h,l,c),vwap(h,l,c,v),obv(c,v),supertrend(h,l,c),ichimoku(h,l,c),volume_sig(c,v),atr_vol(h,l,c),cci(h,l,c),williams_r(h,l,c),mfi(h,l,c,v),donchian(h,l,c),keltner(h,l,c),choppiness(h,l,c),roc(c),calc_kalman_signal(c),calc_frama(h,l,c),hilbert_data,calc_adaptive_rsi(c,hilbert_data.get("cycle_period",14)),calc_entropy(c),calc_ofi(df["open"],h,l,c,v)]
+    entropy_ok=next((i for i in inds if i["indicator"]=="ENTROPY"),{}).get("tradeable",True); chop_ok=next((i for i in inds if i["indicator"]=="CHOPPINESS"),{}).get("tradeable",True)
     ai_score=0
     if use_ai:
         try:
@@ -176,48 +163,49 @@ async def generate_signal(ticker, atype="stock", timeframe="swing", use_ai=False
     except Exception as _e:
         _log.warning(f"bayesian_vote failed for {ticker}: {_e}"); sig,conf="HOLD",50; bv={"p_buy":0.5}
     if not entropy_ok: conf=int(conf*0.5)
-    enhancements = {}
+    if not chop_ok and conf<70: conf=int(conf*0.85)
+    quality=_confidence_quality(inds,conf); enhancements={}
     if use_advanced:
         try:
             from services.llm_sentiment import get_llm_sentiment
-            llm = await get_llm_sentiment(ticker, atype); enhancements["llm_sentiment"] = llm; llm_score = llm.get("score", 0)
-            if llm_score != 0:
-                llm_label = str(llm.get("signal", "NEUTRAL")).upper(); llm_dir = "BUY" if llm_label in ("BULLISH", "BUY") else "SELL" if llm_label in ("BEARISH", "SELL") else "HOLD"; sig_dir = "BUY" if "BUY" in sig else "SELL" if "SELL" in sig else "HOLD"
-                if llm_dir == sig_dir and llm_dir != "HOLD": conf = max(0, min(100, conf + abs(llm_score) * 4))
-                elif llm_dir != sig_dir and llm_dir != "HOLD" and sig_dir != "HOLD": conf = max(0, conf - 5)
+            llm=await get_llm_sentiment(ticker,atype); enhancements["llm_sentiment"]=llm; llm_score=llm.get("score",0)
+            if llm_score!=0:
+                llm_label=str(llm.get("signal","NEUTRAL")).upper(); llm_dir="BUY" if llm_label in ("BULLISH","BUY") else "SELL" if llm_label in ("BEARISH","SELL") else "HOLD"; sig_dir="BUY" if "BUY" in sig else "SELL" if "SELL" in sig else "HOLD"
+                if llm_dir==sig_dir and llm_dir!="HOLD": conf=max(0,min(100,conf+abs(llm_score)*4))
+                elif llm_dir!=sig_dir and llm_dir!="HOLD" and sig_dir!="HOLD": conf=max(0,conf-5)
         except Exception as e: enhancements["llm_sentiment"]={"error":str(e)}
         try:
             from services.volume_profile import get_volume_profile
-            vp = await get_volume_profile(ticker, atype); enhancements["volume_profile"] = {"poc":vp.get("poc"),"vah":vp.get("vah"),"val":vp.get("val"),"signal":vp.get("signal"),"score":vp.get("score"),"reason":vp.get("reason")}
-            if vp.get("score",0)>0 and "BUY" in sig: conf = min(100, conf+3)
-            elif vp.get("score",0)<0 and "SELL" in sig: conf = min(100, conf+3)
-            elif vp.get("score",0)>0 and "SELL" in sig: conf = max(0, conf-5)
+            vp=await get_volume_profile(ticker,atype); enhancements["volume_profile"]={"poc":vp.get("poc"),"vah":vp.get("vah"),"val":vp.get("val"),"signal":vp.get("signal"),"score":vp.get("score"),"reason":vp.get("reason")}
+            if vp.get("score",0)>0 and "BUY" in sig: conf=min(100,conf+3)
+            elif vp.get("score",0)<0 and "SELL" in sig: conf=min(100,conf+3)
+            elif vp.get("score",0)>0 and "SELL" in sig: conf=max(0,conf-5)
         except Exception as e: enhancements["volume_profile"]={"error":str(e)}
-        if atype == "crypto":
+        if atype=="crypto":
             try:
                 from services.microstructure import get_microstructure
-                micro = await get_microstructure(ticker, atype); enhancements["microstructure"] = micro
-                if micro.get("funding_score",0) != 0:
-                    if (micro["funding_score"]>0 and "BUY" in sig) or (micro["funding_score"]<0 and "SELL" in sig): conf = min(100, conf+5)
-                    else: conf = max(0, conf-8)
+                micro=await get_microstructure(ticker,atype); enhancements["microstructure"]=micro
+                if micro.get("funding_score",0)!=0:
+                    if (micro["funding_score"]>0 and "BUY" in sig) or (micro["funding_score"]<0 and "SELL" in sig): conf=min(100,conf+5)
+                    else: conf=max(0,conf-8)
             except Exception as e: enhancements["microstructure"]={"error":str(e)}
         try:
             from services.confluence_memory import get_historical_accuracy
-            mem = await get_historical_accuracy(inds, regime, entropy_ok); enhancements["confluence_memory"] = mem
-            if mem.get("has_history"): conf = max(0, min(100, conf + mem.get("confidence_boost",0)))
+            mem=await get_historical_accuracy(inds,regime,entropy_ok); enhancements["confluence_memory"]=mem
+            if mem.get("has_history"): conf=max(0,min(100,conf+mem.get("confidence_boost",0)))
         except Exception as e: enhancements["confluence_memory"]={"error":str(e)}
+    conf,calibration=await _calibrate_confidence(ticker,atype,timeframe,sig,conf,regime,quality); quality["confidence_calibrated"]=conf
     if conf<40: sig="HOLD"
     try: atr_val=float(ta.volatility.AverageTrueRange(h,l,c,14).average_true_range().dropna().iloc[-1])
     except: atr_val=price*0.02
-    sl=price*(1-cfg["sl"]*atr_val/price) if "BUY" in sig else price*(1+cfg["sl"]*atr_val/price)
-    tp=price*(1+cfg["tp"]*atr_val/price) if "BUY" in sig else price*(1-cfg["tp"]*atr_val/price)
-    result = {"ticker":ticker,"asset_type":atype,"timeframe":timeframe,"signal":sig,"confidence":conf,"price":round(price,4),"sl":round(sl,4),"tp":round(tp,4),"atr":round(atr_val,4),"bars":len(df),"regime":regime,"indicators":inds,"bayesian":bv,"enhancements":enhancements,"timestamp":datetime.utcnow().isoformat()}
+    sl=price*(1-cfg["sl"]*atr_val/price) if "BUY" in sig else price*(1+cfg["sl"]*atr_val/price); tp=price*(1+cfg["tp"]*atr_val/price) if "BUY" in sig else price*(1-cfg["tp"]*atr_val/price)
+    result={"ticker":ticker,"asset_type":atype,"timeframe":timeframe,"signal":sig,"confidence":conf,"price":round(price,4),"sl":round(sl,4),"tp":round(tp,4),"atr":round(atr_val,4),"bars":len(df),"regime":regime,"indicators":inds,"bayesian":bv,"quality":quality,"calibration":calibration,"enhancements":enhancements,"timestamp":datetime.utcnow().isoformat()}
     if use_advanced:
         try:
             from services.meta_learner import predict_signal_quality
-            meta = await predict_signal_quality(result); result["meta_learner"] = meta
+            meta=await predict_signal_quality(result); result["meta_learner"]=meta
             if meta.get("available"):
-                boost = meta.get("boost",0); result["confidence"] = max(0, min(100, conf + boost))
-                if result["confidence"] < 40 and sig != "HOLD": result["signal"] = "HOLD"
+                boost=meta.get("boost",0); result["confidence"]=max(0,min(100,result["confidence"]+boost)); result["calibration"]["meta_boost"]=boost; result["calibration"]["final_after_meta"]=result["confidence"]
+                if result["confidence"]<40 and sig!="HOLD": result["signal"]="HOLD"
         except Exception as e: result["meta_learner"]={"error":str(e)}
     return result
