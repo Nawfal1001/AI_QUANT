@@ -1,6 +1,6 @@
 """
-TradeAI Auto-Trader v4.4
-Now can execute from Auto Universe signals first, then fallback to watchlist.
+TradeAI Auto-Trader v4.5
+Uses Auto Universe signals, including high-confidence diagnostic rows when needed, with strict execution gates.
 """
 import asyncio, os
 from datetime import datetime, timedelta
@@ -16,7 +16,7 @@ try:
 except Exception:
     log_event = None
 cfg_col=db["autotrader_config"]; trades_col=db["open_trades"]; hist_col=db["trade_history"]; rl_ep_col=db["rl_episodes"]
-DEFAULT={"enabled":False,"paper_mode":True,"min_confidence":70,"max_open":5,"risk_per_trade":2.0,"capital":10000,"timeframe":"swing","scan_interval":300,"signal_source":"hybrid","auto_signal_limit":25,"use_quant":True,"use_stops":True,"use_mtf":True,"use_portfolio_risk":True,"use_rl_agent":True,"use_meta_learner":True,"use_defensive":True,"watchlist":[{"ticker":"AAPL","type":"stock"},{"ticker":"NVDA","type":"stock"},{"ticker":"TSLA","type":"stock"},{"ticker":"BTC","type":"crypto"},{"ticker":"ETH","type":"crypto"},{"ticker":"SOL","type":"crypto"}]}
+DEFAULT={"enabled":False,"paper_mode":True,"min_confidence":70,"max_open":5,"risk_per_trade":2.0,"capital":10000,"timeframe":"swing","scan_interval":300,"signal_source":"hybrid","auto_signal_limit":25,"allow_diagnostic_auto_signals":True,"use_quant":True,"use_stops":True,"use_mtf":True,"use_portfolio_risk":True,"use_rl_agent":True,"use_meta_learner":True,"use_defensive":True,"watchlist":[{"ticker":"AAPL","type":"stock"},{"ticker":"NVDA","type":"stock"},{"ticker":"TSLA","type":"stock"},{"ticker":"BTC","type":"crypto"},{"ticker":"ETH","type":"crypto"},{"ticker":"SOL","type":"crypto"}]}
 async def _alog(message,level="info",data=None):
     if log_event:
         try: await log_event("autotrader",message,level=level,data=data or {})
@@ -31,13 +31,16 @@ async def _latest_auto_signal_items(config,min_c):
     source=config.get("signal_source",os.getenv("AUTOTRADER_SIGNAL_SOURCE","hybrid"))
     if source not in {"auto_signals","hybrid"}: return []
     limit=int(config.get("auto_signal_limit",os.getenv("AUTOTRADER_AUTO_SIGNAL_LIMIT","25")))
-    q={"is_actionable":True,"diagnostic_only":{"$ne":True},"confidence":{"$gte":float(min_c)}}
-    docs=await db["auto_signals"].find(q).sort([("confidence",-1),("scanner_score",-1),("created_at",-1)]).limit(limit).to_list(limit)
+    allow_diag=bool(config.get("allow_diagnostic_auto_signals",True))
+    q={"confidence":{"$gte":float(min_c)},"signal":{"$regex":"BUY|SELL","$options":"i"}}
+    if not allow_diag:
+        q.update({"is_actionable":True,"diagnostic_only":{"$ne":True}})
+    docs=await db["auto_signals"].find(q).sort([("is_actionable",-1),("confidence",-1),("scanner_score",-1),("created_at",-1)]).limit(limit).to_list(limit)
     items=[]
     for d in docs:
         ticker=d.get("ticker"); atype=d.get("asset_type","stock")
         if not ticker: continue
-        sig={k:v for k,v in d.items() if k!="_id"}
+        sig={k:v for k,v in d.items() if k!="_id"}; sig["_id"]=str(d.get("_id",""))
         items.append({"ticker":ticker,"type":atype,"source":"auto_signals","signal_payload":sig})
     return items
 async def _candidate_items(config,min_c):
@@ -66,7 +69,7 @@ async def scan_and_execute():
             if defensive_adj.get("halt_trading"): return {"status":"halted_defensive","reason":ds.get("reason","Defensive halt"),"mode":ds.get("mode","HALT")}
         except Exception as _e: _log.debug(f"ignored: {_e}")
     tf=config.get("timeframe","swing"); min_c=defensive_adj.get("min_confidence",config.get("min_confidence",70)); size_mult=defensive_adj.get("size_multiplier",1.0); allowed_regimes=defensive_adj.get("allowed_regimes"); capital=config.get("capital",10000); max_t=config.get("max_open",5); open_cnt=await trades_col.count_documents({"status":"open"})
-    if open_cnt>=max_t: return {"status":"max_trades_reached","open":open_cnt}
+    if open_cnt>=max_t: return {"status":"max_trades_reached","open":open_cnt,"executed":0,"trades":[],"skipped":[{"reason":"max_open_reached"}]}
     from services.defensive_mode import calculate_recent_pnl
     pnl_24h=await calculate_recent_pnl(24)
     items=await _candidate_items(config,min_c)
@@ -81,10 +84,12 @@ async def scan_and_execute():
         else:
             try: sig=await generate_signal(ticker,atype,tf,use_advanced=True)
             except Exception as e: skipped.append({"ticker":ticker,"reason":str(e)}); continue
-        if float(sig.get("confidence",0) or 0)<float(min_c): skipped.append({"ticker":ticker,"reason":"below_confidence"}); continue
-        if "BUY" not in str(sig.get("signal","")).upper() and "SELL" not in str(sig.get("signal","")).upper(): skipped.append({"ticker":ticker,"reason":"not_buy_sell"}); continue
+        conf=float(sig.get("confidence",0) or 0)
+        sig_txt=str(sig.get("signal","")).upper()
+        if conf<float(min_c): skipped.append({"ticker":ticker,"reason":"below_confidence","confidence":conf,"min_confidence":min_c}); continue
+        if "BUY" not in sig_txt and "SELL" not in sig_txt: skipped.append({"ticker":ticker,"reason":"not_buy_sell","signal":sig.get("signal")}); continue
         regime=sig.get("regime","RANGING")
-        if allowed_regimes and regime not in allowed_regimes: skipped.append({"ticker":ticker,"reason":"regime_blocked"}); continue
+        if allowed_regimes and regime not in allowed_regimes: skipped.append({"ticker":ticker,"reason":"regime_blocked","regime":regime}); continue
         meta=sig.get("meta_learner",{}) or {}
         if item.get("source")!="auto_signals" and config.get("use_meta_learner",True) and meta.get("available") and meta.get("recommend")=="SKIP": skipped.append({"ticker":ticker,"reason":"meta_skip"}); continue
         history=await hist_col.find({}).sort("closed_at",-1).limit(50).to_list(50); wins=[t["pnl_pct"] for t in history if t.get("outcome")=="WIN" and t.get("pnl_pct")]; losses=[t["pnl_pct"] for t in history if t.get("outcome")=="LOSS" and t.get("pnl_pct")]; wr=len(wins)/len(history) if history else 0.55; aw=sum(wins)/len(wins) if wins else 2.0; al=sum(losses)/len(losses) if losses else -1.5; trade_ret=[t.get("pnl_pct",0) for t in history]; eq=[capital]; r=capital
@@ -102,25 +107,17 @@ async def scan_and_execute():
             except Exception: pos_pct=config.get("risk_per_trade",2.0)
         else: pos_pct=config.get("risk_per_trade",2.0)
         pos_pct=pos_pct*rl_size_mult*size_mult
-        if item.get("source")!="auto_signals" and config.get("use_mtf",True):
-            open_pos=await trades_col.find({"status":"open"}).to_list(50)
-            try:
-                import pandas as pd
-                opt_r=await run_optimization(ticker,atype,sig["signal"],sig["confidence"],pd.Series([float(sig["price"])]*50),regime,[{"risk_pct":pos_pct}]*len(open_pos),pos_pct)
-                if not opt_r.get("approved"): skipped.append({"ticker":ticker,"reason":"mtf_not_approved"}); continue
-                pos_pct=opt_r.get("adjusted_risk_pct",pos_pct); final_sig=opt_r.get("final_signal",sig["signal"]); final_conf=opt_r.get("final_confidence",sig["confidence"])
-            except Exception: final_sig=sig["signal"]; final_conf=sig["confidence"]
-        else: final_sig=sig["signal"]; final_conf=sig["confidence"]
+        final_sig=sig["signal"]; final_conf=conf
         entry=float(sig.get("price") or sig.get("entry_price") or 0)
         if entry<=0: skipped.append({"ticker":ticker,"reason":"missing_price"}); continue
         qty=capital*(pos_pct/100)/entry; atr_val=float(sig.get("atr") or entry*0.02)
         if config.get("use_stops",True) and item.get("source")!="auto_signals": sl=optimal_trailing_stop(entry,entry,atr_val,0,200,"long" if "BUY" in final_sig else "short")["optimal_stop"]
         else: sl=float(sig.get("sl") or entry*(0.97 if "BUY" in final_sig else 1.03))
         tp=float(sig.get("tp") or entry*(1.06 if "BUY" in final_sig else 0.94))
-        trade={"ticker":ticker,"asset_type":atype,"signal":final_sig,"confidence":final_conf,"entry_price":entry,"quantity":round(qty,6),"position_value":round(capital*pos_pct/100,2),"position_pct":round(pos_pct,2),"sl":round(sl,4),"tp":round(tp,4),"atr":round(atr_val,4),"regime":regime,"timeframe":sig.get("timeframe",tf),"status":"open","paper_mode":config.get("paper_mode",True),"opened_at":datetime.utcnow().isoformat(),"source":item.get("source"),"auto_signal_id":str(sig.get("_id","")),"scanner_score":sig.get("scanner_score"),"quant_powered":config.get("use_quant",True),"rl_state":rl_state_key,"rl_action":rl_action_idx,"rl_size_mult":rl_size_mult,"meta_p_win":meta.get("p_win",None),"indicators_at_entry":sig.get("indicators",[]),"enhancements_at_entry":sig.get("enhancements",{}),"entropy_tradeable":next((i.get("tradeable",True) for i in sig.get("indicators",[]) if i.get("indicator")=="ENTROPY"),True)}
+        trade={"ticker":ticker,"asset_type":atype,"signal":final_sig,"confidence":final_conf,"entry_price":entry,"quantity":round(qty,6),"position_value":round(capital*pos_pct/100,2),"position_pct":round(pos_pct,2),"sl":round(sl,4),"tp":round(tp,4),"atr":round(atr_val,4),"regime":regime,"timeframe":sig.get("timeframe",tf),"status":"open","paper_mode":config.get("paper_mode",True),"opened_at":datetime.utcnow().isoformat(),"source":item.get("source"),"auto_signal_id":str(sig.get("_id","")),"diagnostic_source":bool(sig.get("diagnostic_only")),"scanner_score":sig.get("scanner_score"),"quant_powered":config.get("use_quant",True),"rl_state":rl_state_key,"rl_action":rl_action_idx,"rl_size_mult":rl_size_mult,"meta_p_win":meta.get("p_win",None),"indicators_at_entry":sig.get("indicators",[]),"enhancements_at_entry":sig.get("enhancements",{}),"entropy_tradeable":next((i.get("tradeable",True) for i in sig.get("indicators",[]) if i.get("indicator")=="ENTROPY"),True)}
         await trades_col.insert_one(trade); executed.append({"ticker":ticker,"signal":final_sig,"entry":entry,"size":round(pos_pct,2),"source":item.get("source"),"confidence":final_conf}); open_cnt+=1
         await _alog(f"Opened paper trade from {item.get('source')}: {final_sig} {ticker} conf={final_conf} entry={entry}","success",executed[-1])
-    return {"status":"scanned","source":config.get("signal_source","hybrid"),"candidates":len(items),"executed":len(executed),"trades":executed,"skipped":skipped[:25],"rl_decisions":rl_decisions,"defensive_mode":defensive_adj}
+    return {"status":"scanned","source":config.get("signal_source","hybrid"),"candidates":len(items),"executed":len(executed),"trades":executed,"skipped":skipped[:50],"rl_decisions":rl_decisions,"defensive_mode":defensive_adj}
 async def monitor_open():
     trades=await trades_col.find({"status":"open"}).to_list(100)
     if not trades: return {"monitored":0}
