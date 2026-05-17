@@ -15,7 +15,7 @@ from routers import (
     risk, paper, signal_perf, strategy_lab, bots as bots_router, macro,
     runtime_controls as runtime_controls_router, context as context_router,
     auto_signals as auto_signals_router, calendar as calendar_router,
-    asi as asi_router, logs as logs_router,
+    asi as asi_router, logs as logs_router, diagnostics as diagnostics_router,
 )
 
 @asynccontextmanager
@@ -68,7 +68,7 @@ else:
     if _environment == "production": raise RuntimeError("CORS_ORIGINS must be set in production")
     app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_credentials=True, allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"], allow_headers=["Authorization", "Content-Type", "X-Requested-With"])
 
-for r,p,t in [(auth.router,"/api/auth","Auth"),(market.router,"/api/market","Market"),(sentiment.router,"/api/sentiment","Sentiment"),(signals.router,"/api/signals","Signals"),(auto_signals_router.router,"/api/auto-signals","Auto Signals"),(portfolio.router,"/api/portfolio","Portfolio"),(alerts.router,"/api/alerts","Alerts"),(ai_research.router,"/api/ai","AI"),(backtest.router,"/api/backtest","Backtest"),(reward.router,"/api/reward","Rewards"),(auto_trader.router,"/api/autotrader","AutoTrader"),(strategy.router,"/api/strategy","Strategy"),(quant.router,"/api/quant","Quant"),(resolver.router,"/api/resolver","Resolver"),(broker.router,"/api/broker","Broker"),(learning.router,"/api/learning","Learning"),(advanced.router,"/api/advanced","Advanced"),(risk.router,"/api/risk","Risk"),(paper.router,"/api/paper","Paper Trading"),(signal_perf.router,"/api/signal-perf","Signal Performance"),(strategy_lab.router,"/api/strategy-lab","Strategy Lab"),(bots_router.router,"/api/bots","Bots"),(macro.router,"/api/macro","Macro"),(runtime_controls_router.router,"/api/runtime-controls","Runtime Controls"),(context_router.router,"/api/context","Market Context"),(calendar_router.router,"/api/calendar","Economic Calendar"),(asi_router.router,"/api/asi","ASI Evolve"),(logs_router.router,"/api/logs","Logs")]: app.include_router(r, prefix=p, tags=[t])
+for r,p,t in [(auth.router,"/api/auth","Auth"),(market.router,"/api/market","Market"),(sentiment.router,"/api/sentiment","Sentiment"),(signals.router,"/api/signals","Signals"),(auto_signals_router.router,"/api/auto-signals","Auto Signals"),(portfolio.router,"/api/portfolio","Portfolio"),(alerts.router,"/api/alerts","Alerts"),(ai_research.router,"/api/ai","AI"),(backtest.router,"/api/backtest","Backtest"),(reward.router,"/api/reward","Rewards"),(auto_trader.router,"/api/autotrader","AutoTrader"),(strategy.router,"/api/strategy","Strategy"),(quant.router,"/api/quant","Quant"),(resolver.router,"/api/resolver","Resolver"),(broker.router,"/api/broker","Broker"),(learning.router,"/api/learning","Learning"),(advanced.router,"/api/advanced","Advanced"),(risk.router,"/api/risk","Risk"),(paper.router,"/api/paper","Paper Trading"),(signal_perf.router,"/api/signal-perf","Signal Performance"),(strategy_lab.router,"/api/strategy-lab","Strategy Lab"),(bots_router.router,"/api/bots","Bots"),(macro.router,"/api/macro","Macro"),(runtime_controls_router.router,"/api/runtime-controls","Runtime Controls"),(context_router.router,"/api/context","Market Context"),(calendar_router.router,"/api/calendar","Economic Calendar"),(asi_router.router,"/api/asi","ASI Evolve"),(logs_router.router,"/api/logs","Logs"),(diagnostics_router.router,"/api/diagnostics","Diagnostics")]: app.include_router(r, prefix=p, tags=[t])
 
 from websocket_manager import manager
 UNSAFE_SECRETS = {"tradeai_secret_change_me", "change_me", "secret", "test"}
@@ -95,4 +95,4 @@ async def ws(websocket: WebSocket):
     except (WebSocketDisconnect, Exception): manager.disconnect(websocket)
 @app.get("/")
 def root():
-    return {"status":"TradeAI Platform v6.3 🚀","docs":"/docs","auto_signal_scanner":True,"asi_evolve":True,"optuna_backtest":True,"global_logs":True,"features":["user-scoping","risk-engine","paper-broker-v2","multi-strategy-backtest","optuna-optimization","asi-evolve-strategy-generation","tradingview-style-local-indicators","shared-cache","websocket-prices"]}
+    return {"status":"TradeAI Platform v6.3 🚀","docs":"/docs","auto_signal_scanner":True,"asi_evolve":True,"optuna_backtest":True,"global_logs":True,"diagnostics":True,"features":["user-scoping","risk-engine","paper-broker-v2","multi-strategy-backtest","optuna-optimization","asi-evolve-strategy-generation","tradingview-style-local-indicators","shared-cache","websocket-prices","environment-diagnostics"]}
