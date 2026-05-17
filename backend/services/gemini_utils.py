@@ -22,19 +22,24 @@ Think like a professional desk analyst:
 - Never pretend to have live data unless the provided input includes it.
 """.strip()
 
-DEFAULT_GEMINI_MODEL = "gemini-1.5-flash"
-SAFE_FALLBACK_MODELS = ["gemini-1.5-flash", "gemini-1.5-flash-002", "gemini-1.0-pro"]
-PRO_MODEL_ALIASES = {"gemini-pro", "gemini-1.0-pro", "gemini-1.5-pro", "models/gemini-pro", "models/gemini-1.0-pro", "models/gemini-1.5-pro"}
-BAD_MODEL_ALIASES = {"gemini-1.5-flash-latest", "models/gemini-1.5-flash-latest", "gemini-flash-latest", "models/gemini-flash-latest"}
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+SAFE_FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash-002"]
+BAD_MODEL_ALIASES = {
+    "gemini-1.5-flash-latest",
+    "models/gemini-1.5-flash-latest",
+    "gemini-flash-latest",
+    "models/gemini-flash-latest",
+}
 
 def get_gemini_api_key() -> str:
     return (os.getenv("GEMINI_API_KEY") or os.getenv("GEMINY_API_KEY") or os.getenv("GOOGLE_API_KEY") or os.getenv("GOOGLE_GEMINI_API_KEY") or "").strip()
 
 def _clean_model_name(name: str) -> str:
-    name=(name or "").strip()
-    if name.startswith("models/"): name=name.split("/",1)[1]
-    if name in BAD_MODEL_ALIASES: return DEFAULT_GEMINI_MODEL
-    if name in PRO_MODEL_ALIASES or name.endswith("-pro"): return DEFAULT_GEMINI_MODEL
+    name = (name or "").strip()
+    if name.startswith("models/"):
+        name = name.split("/", 1)[1]
+    if name in BAD_MODEL_ALIASES:
+        return DEFAULT_GEMINI_MODEL
     return name or DEFAULT_GEMINI_MODEL
 
 def get_gemini_model_name() -> str:
@@ -51,47 +56,67 @@ def get_model(model_name: str | None = None):
     return genai.GenerativeModel(_clean_model_name(model_name or get_gemini_model_name()))
 
 def _is_model_not_found(err: Exception) -> bool:
-    s=str(err).lower()
+    s = str(err).lower()
     return "404" in s or "not found" in s or "not supported for generatecontent" in s
 
 def generate_content(prompt: str):
-    tried=[]
-    first=get_gemini_model_name()
-    for name in [first]+[m for m in SAFE_FALLBACK_MODELS if m!=first]:
+    first = get_gemini_model_name()
+    tried = []
+    last_error = None
+    for name in [first] + [m for m in SAFE_FALLBACK_MODELS if m != first]:
         tried.append(name)
         try:
             return get_model(name).generate_content(prompt)
         except Exception as e:
-            if not _is_model_not_found(e) or name==SAFE_FALLBACK_MODELS[-1]:
+            last_error = e
+            if not _is_model_not_found(e):
                 raise
             continue
+    raise last_error
 
 def ping() -> Dict[str, Any]:
     import time
-    out={"available":False,"model":get_gemini_model_name(),"reason":"","latency_ms":0,"key_source":""}
-    key=get_gemini_api_key()
+    out = {"available": False, "model": get_gemini_model_name(), "reason": "", "latency_ms": 0, "key_source": ""}
+    key = get_gemini_api_key()
     if not key:
-        out["reason"]="GEMINI_API_KEY (or GEMINY_API_KEY / GOOGLE_API_KEY / GOOGLE_GEMINI_API_KEY) is not set"; return out
-    for name in ("GEMINI_API_KEY","GEMINY_API_KEY","GOOGLE_API_KEY","GOOGLE_GEMINI_API_KEY"):
-        if os.getenv(name,"").strip()==key: out["key_source"]=name; break
+        out["reason"] = "GEMINI_API_KEY (or GEMINY_API_KEY / GOOGLE_API_KEY / GOOGLE_GEMINI_API_KEY) is not set"
+        return out
+    for name in ("GEMINI_API_KEY", "GEMINY_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GEMINI_API_KEY"):
+        if os.getenv(name, "").strip() == key:
+            out["key_source"] = name
+            break
     try:
-        t0=time.time(); resp=generate_content('Reply with the JSON: {"ok":true}'); out["latency_ms"]=int((time.time()-t0)*1000)
-        text=(resp.text or "").strip(); out["available"]="ok" in text.lower() or "true" in text.lower(); out["reason"]="Connected" if out["available"] else f"Unexpected response: {text[:120]}"; out["model"]=get_gemini_model_name(); return out
+        t0 = time.time()
+        resp = generate_content('Reply with the JSON: {"ok":true}')
+        out["latency_ms"] = int((time.time() - t0) * 1000)
+        text = (resp.text or "").strip()
+        out["available"] = "ok" in text.lower() or "true" in text.lower()
+        out["reason"] = "Connected" if out["available"] else f"Unexpected response: {text[:120]}"
+        out["model"] = get_gemini_model_name()
+        return out
     except Exception as e:
-        out["reason"]=f"Gemini API error: {str(e)[:200]}"; return out
+        out["reason"] = f"Gemini API error: {str(e)[:200]}"
+        return out
 
 def parse_json_object(text: str, fallback: Dict[str, Any]) -> Dict[str, Any]:
-    try: return json.loads(text)
-    except Exception: pass
-    match=re.search(r"\{.*\}", text or "", re.S)
-    if not match: return dict(fallback)
-    try: return json.loads(match.group())
-    except Exception: return dict(fallback)
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    match = re.search(r"\{.*\}", text or "", re.S)
+    if not match:
+        return dict(fallback)
+    try:
+        return json.loads(match.group())
+    except Exception:
+        return dict(fallback)
 
 def clamp_number(value: Any, low: float, high: float, default: float) -> float:
-    try: v=float(value)
-    except Exception: v=default
-    return max(low,min(high,v))
+    try:
+        v = float(value)
+    except Exception:
+        v = default
+    return max(low, min(high, v))
 
 def json_only_guardrails(task: str, schema: str, rules: str = "") -> str:
     return f"""
