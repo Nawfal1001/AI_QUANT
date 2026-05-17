@@ -36,8 +36,8 @@ async def _run_one(jid,broker,asset_type,timeframe,interval,use_ai):
     except Exception as e:
         await _log(jid,f'Scan failed: {e}','error'); _set(jid,status='failed',progress=100,error=str(e))
 @router.get('/latest')
-async def latest(broker: str = None, asset_type: str = None, limit: int = 50, user=Depends(get_current_user)):
-    return {"signals": await latest_auto_signals(broker_id=broker, asset_type=asset_type, limit=limit)}
+async def latest(broker: str = None, asset_type: str = None, execution_mode: str = None, limit: int = 50, user=Depends(get_current_user)):
+    return {"signals": await latest_auto_signals(broker_id=broker, asset_type=asset_type, execution_mode=execution_mode, limit=limit)}
 @router.post('/scan')
 async def scan_now(user=Depends(get_current_user)):
     jid=_new_job('all'); asyncio.create_task(_run_all(jid)); return {"job_id":jid,"status":"queued","progress":0}
