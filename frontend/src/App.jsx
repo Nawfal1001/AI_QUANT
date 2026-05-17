@@ -22,17 +22,15 @@ import Settings from '@/pages/Settings'
 import Research from '@/pages/Research'
 import StrategyLab from '@/pages/StrategyLab'
 import Bots from '@/pages/Bots'
+import Logs from '@/pages/Logs'
 
 export default function App() {
   const { validateToken, booting, booted } = useAuthStore()
 
   useEffect(() => {
-    // Validate any stored token on app boot
     validateToken()
   }, [])
 
-  // While we're validating the stored token, show a loading screen so we don't
-  // briefly render the auth page for a logged-in user
   if (booting || !booted) {
     return (
       <div style={{ background: '#0d1117', minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -43,31 +41,32 @@ export default function App() {
 
   return (
     <ErrorBoundary>
-    <BrowserRouter>
-      <Toaster position="top-right" toastOptions={{ style: { background: '#161b22', color: '#e2e8f0', border: '1px solid #21262d' } }} />
-      <Routes>
-        <Route path="/auth" element={<AuthPage />} />
-        <Route path="/" element={<ProtectedRoute><Layout /></ProtectedRoute>}>
-          <Route index element={<Navigate to="/dashboard" replace />} />
-          <Route path="dashboard"  element={<Dashboard />} />
-          <Route path="portfolio"  element={<Portfolio />} />
-          <Route path="signals"    element={<Signals />} />
-          <Route path="strategy"   element={<StrategyDashboard />} />
-          <Route path="quant"      element={<QuantDashboard />} />
-          <Route path="autotrader" element={<AutoTrader />} />
-          <Route path="learning"   element={<Learning />} />
-          <Route path="backtest"   element={<Backtest />} />
-          <Route path="rewards"    element={<Rewards />} />
-          <Route path="brokers"    element={<Brokers />} />
-          <Route path="alerts"     element={<Alerts />} />
-          <Route path="settings"   element={<Settings />} />
-          <Route path="research"   element={<Research />} />
-          <Route path="strategy-lab" element={<StrategyLab />} />
-          <Route path="bots"       element={<Bots />} />
-        </Route>
-        <Route path="*" element={<Navigate to="/dashboard" replace />} />
-      </Routes>
-    </BrowserRouter>
+      <BrowserRouter>
+        <Toaster position="top-right" toastOptions={{ style: { background: '#161b22', color: '#e2e8f0', border: '1px solid #21262d' } }} />
+        <Routes>
+          <Route path="/auth" element={<AuthPage />} />
+          <Route path="/" element={<ProtectedRoute><Layout /></ProtectedRoute>}>
+            <Route index element={<Navigate to="/dashboard" replace />} />
+            <Route path="dashboard" element={<Dashboard />} />
+            <Route path="portfolio" element={<Portfolio />} />
+            <Route path="signals" element={<Signals />} />
+            <Route path="strategy" element={<StrategyDashboard />} />
+            <Route path="quant" element={<QuantDashboard />} />
+            <Route path="autotrader" element={<AutoTrader />} />
+            <Route path="learning" element={<Learning />} />
+            <Route path="backtest" element={<Backtest />} />
+            <Route path="rewards" element={<Rewards />} />
+            <Route path="brokers" element={<Brokers />} />
+            <Route path="alerts" element={<Alerts />} />
+            <Route path="settings" element={<Settings />} />
+            <Route path="research" element={<Research />} />
+            <Route path="strategy-lab" element={<StrategyLab />} />
+            <Route path="bots" element={<Bots />} />
+            <Route path="logs" element={<Logs />} />
+          </Route>
+          <Route path="*" element={<Navigate to="/dashboard" replace />} />
+        </Routes>
+      </BrowserRouter>
     </ErrorBoundary>
   )
 }
