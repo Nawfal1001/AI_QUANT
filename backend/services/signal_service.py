@@ -1,7 +1,6 @@
 """
-TradeAI Signal Service v4.5
-Adds confidence calibration, richer signal quality diagnostics, and extra indicators:
-CCI, Williams %R, MFI, Donchian breakout, Keltner channel, Choppiness, ROC.
+TradeAI Signal Service v4.6
+Adds true intraday timeframe support and higher-timeframe confirmation.
 """
 import asyncio, numpy as np, pandas as pd, ta
 from datetime import datetime, timedelta
@@ -12,7 +11,21 @@ from services.advanced_indicators import calc_kalman_signal,calc_frama,calc_hilb
 from services.bayesian_engine import bayesian_vote
 from services.logger import child as _child_log
 _log = _child_log('signal_service')
-TF={"scalping":{"period":80,"days":90,"interval":"1d","atr":14,"sl":0.5,"tp":1.0},"intraday":{"period":120,"days":180,"interval":"1d","atr":14,"sl":1.0,"tp":2.0},"swing":{"period":220,"days":365,"interval":"1d","atr":14,"sl":1.5,"tp":3.0},"position":{"period":320,"days":730,"interval":"1d","atr":14,"sl":2.0,"tp":4.0}}
+TF={
+ "1m":{"period":240,"days":7,"interval":"1m","atr":14,"sl":0.45,"tp":0.9},
+ "5m":{"period":240,"days":14,"interval":"5m","atr":14,"sl":0.55,"tp":1.1},
+ "15m":{"period":220,"days":30,"interval":"15m","atr":14,"sl":0.75,"tp":1.5},
+ "30m":{"period":220,"days":45,"interval":"30m","atr":14,"sl":0.9,"tp":1.8},
+ "1h":{"period":220,"days":90,"interval":"1h","atr":14,"sl":1.1,"tp":2.2},
+ "4h":{"period":220,"days":180,"interval":"4h","atr":14,"sl":1.35,"tp":2.7},
+ "1d":{"period":220,"days":365,"interval":"1d","atr":14,"sl":1.5,"tp":3.0},
+ "1w":{"period":180,"days":1600,"interval":"1wk","atr":14,"sl":2.0,"tp":4.0},
+ "scalping":{"period":200,"days":14,"interval":"5m","atr":14,"sl":0.55,"tp":1.1},
+ "intraday":{"period":220,"days":45,"interval":"30m","atr":14,"sl":0.9,"tp":1.8},
+ "swing":{"period":220,"days":365,"interval":"1d","atr":14,"sl":1.5,"tp":3.0},
+ "position":{"period":320,"days":1600,"interval":"1wk","atr":14,"sl":2.0,"tp":4.0},
+}
+MTF_CONFIRMATIONS={"1m":["5m","15m"],"5m":["15m","30m"],"15m":["30m","1h"],"30m":["1h","4h"],"1h":["4h","1d"],"4h":["1d"],"1d":["1w"],"scalping":["15m","30m"],"intraday":["1h","4h"],"swing":["1w"],"position":[]}
 def _normalize_df(df,period):
     if df is None or len(df)==0: return pd.DataFrame()
     out=df.copy(); out=out.rename(columns={c:str(c).lower() for c in out.columns}); needed=["open","high","low","close","volume"]
@@ -27,7 +40,7 @@ def _fetch(ticker,atype,period,days=365,interval="1d"):
         finally:
             loop.close(); asyncio.set_event_loop(None)
         return _normalize_df(df,period)
-    except Exception as e: _log.warning(f"shared fetch failed for {ticker} ({atype}): {e}"); return pd.DataFrame()
+    except Exception as e: _log.warning(f"shared fetch failed for {ticker} ({atype}) interval={interval}: {e}"); return pd.DataFrame()
 def _ind(name,val,signal,score,reason,**extra):
     return {"indicator":name,"value":val,"signal":signal,"score":score,"reason":reason,**extra}
 def rsi(c):
@@ -141,9 +154,9 @@ async def _calibrate_confidence(ticker,atype,timeframe,signal,conf,regime,qualit
             wins=sum(1 for d in docs if d.get("outcome")=="WIN" or float(d.get("pnl_pct",0) or 0)>0); wr=wins/len(docs)*100; adj=(wr-50)*0.25; calibrated+=adj; details.update({"samples":len(docs),"historical_win_rate":round(wr,2),"history_adjustment":round(adj,2)})
     except Exception as e: details["history_error"]=str(e)
     calibrated=max(0,min(100,calibrated)); details["after"]=round(calibrated,2); return int(round(calibrated)),details
-async def generate_signal(ticker,atype="stock",timeframe="swing",use_ai=False,use_advanced=True):
+async def _base_signal(ticker,atype,timeframe,use_ai=False,allow_advanced=False):
     cfg=TF.get(timeframe,TF["swing"]); loop=asyncio.get_event_loop(); df=await loop.run_in_executor(None,partial(_fetch,ticker,atype,cfg["period"],cfg.get("days",365),cfg.get("interval","1d")))
-    if df.empty or len(df)<50: return {"ticker":ticker,"asset_type":atype,"timeframe":timeframe,"signal":"HOLD","confidence":0,"error":f"Not enough candle data for {ticker} ({atype}). Received {len(df)} bars; need at least 50.","timestamp":datetime.utcnow().isoformat(),"indicators":[],"bayesian":{}}
+    if df.empty or len(df)<50: return {"ticker":ticker,"asset_type":atype,"timeframe":timeframe,"signal":"HOLD","confidence":0,"error":f"Not enough candle data for {ticker} ({atype}). Received {len(df)} bars; need at least 50.","timestamp":datetime.utcnow().isoformat(),"indicators":[],"bayesian":{},"interval":cfg.get("interval")}
     c=df["close"]; h=df["high"]; l=df["low"]; v=df["volume"]; price=float(c.iloc[-1]); weights=await get_weights(); hilbert_data=calc_hilbert(c)
     inds=[rsi(c),macd(c),ema(c),bollinger(c),stoch(h,l,c),adx(h,l,c),vwap(h,l,c,v),obv(c,v),supertrend(h,l,c),ichimoku(h,l,c),volume_sig(c,v),atr_vol(h,l,c),cci(h,l,c),williams_r(h,l,c),mfi(h,l,c,v),donchian(h,l,c),keltner(h,l,c),choppiness(h,l,c),roc(c),calc_kalman_signal(c),calc_frama(h,l,c),hilbert_data,calc_adaptive_rsi(c,hilbert_data.get("cycle_period",14)),calc_entropy(c),calc_ofi(df["open"],h,l,c,v)]
     entropy_ok=next((i for i in inds if i["indicator"]=="ENTROPY"),{}).get("tradeable",True); chop_ok=next((i for i in inds if i["indicator"]=="CHOPPINESS"),{}).get("tradeable",True)
@@ -165,7 +178,7 @@ async def generate_signal(ticker,atype="stock",timeframe="swing",use_ai=False,us
     if not entropy_ok: conf=int(conf*0.5)
     if not chop_ok and conf<70: conf=int(conf*0.85)
     quality=_confidence_quality(inds,conf); enhancements={}
-    if use_advanced:
+    if allow_advanced:
         try:
             from services.llm_sentiment import get_llm_sentiment
             llm=await get_llm_sentiment(ticker,atype); enhancements["llm_sentiment"]=llm; llm_score=llm.get("score",0)
@@ -199,13 +212,59 @@ async def generate_signal(ticker,atype="stock",timeframe="swing",use_ai=False,us
     try: atr_val=float(ta.volatility.AverageTrueRange(h,l,c,14).average_true_range().dropna().iloc[-1])
     except: atr_val=price*0.02
     sl=price*(1-cfg["sl"]*atr_val/price) if "BUY" in sig else price*(1+cfg["sl"]*atr_val/price); tp=price*(1+cfg["tp"]*atr_val/price) if "BUY" in sig else price*(1-cfg["tp"]*atr_val/price)
-    result={"ticker":ticker,"asset_type":atype,"timeframe":timeframe,"signal":sig,"confidence":conf,"price":round(price,4),"sl":round(sl,4),"tp":round(tp,4),"atr":round(atr_val,4),"bars":len(df),"regime":regime,"indicators":inds,"bayesian":bv,"quality":quality,"calibration":calibration,"enhancements":enhancements,"timestamp":datetime.utcnow().isoformat()}
+    return {"ticker":ticker,"asset_type":atype,"timeframe":timeframe,"interval":cfg.get("interval"),"signal":sig,"confidence":conf,"price":round(price,4),"sl":round(sl,4),"tp":round(tp,4),"atr":round(atr_val,4),"bars":len(df),"regime":regime,"indicators":inds,"bayesian":bv,"quality":quality,"calibration":calibration,"enhancements":enhancements,"timestamp":datetime.utcnow().isoformat()}
+def _dir(sig):
+    s=str(sig or "").upper()
+    return "BUY" if "BUY" in s else "SELL" if "SELL" in s else "HOLD"
+async def _mtf_confirm(ticker,atype,base_timeframe,base_signal,base_conf,use_ai=False):
+    frames=MTF_CONFIRMATIONS.get(base_timeframe,[]); confirmations=[]
+    base_dir=_dir(base_signal); agree=0; oppose=0; hold=0; errors=0
+    if base_dir=="HOLD" or not frames:
+        return {"enabled":bool(frames),"base_timeframe":base_timeframe,"confirmations":[],"agreement":0,"decision":"not_required" if not frames else "base_hold","confidence_adjustment":0}
+    for tf in frames:
+        r=await _base_signal(ticker,atype,tf,use_ai=False,allow_advanced=False)
+        d=_dir(r.get("signal")); c=float(r.get("confidence",0) or 0)
+        confirmations.append({"timeframe":tf,"interval":r.get("interval"),"signal":r.get("signal"),"direction":d,"confidence":c,"error":r.get("error")})
+        if r.get("error"): errors+=1
+        elif d==base_dir and c>=45: agree+=1
+        elif d in {"BUY","SELL"} and d!=base_dir and c>=45: oppose+=1
+        else: hold+=1
+    usable=max(1,len(frames)-errors); agreement=agree/usable
+    adj=0; decision="neutral"
+    if oppose>=1 and agree==0:
+        adj=-22; decision="blocked_by_mtf_opposition"
+    elif oppose>=1:
+        adj=-12; decision="reduced_by_mtf_conflict"
+    elif agree==len(frames):
+        adj=8; decision="boosted_by_full_mtf_agreement"
+    elif agree>=1:
+        adj=4; decision="boosted_by_partial_mtf_agreement"
+    else:
+        adj=-8; decision="reduced_by_no_mtf_confirmation"
+    return {"enabled":True,"base_timeframe":base_timeframe,"confirmations":confirmations,"agreement":round(agreement,3),"agree":agree,"oppose":oppose,"hold":hold,"errors":errors,"decision":decision,"confidence_adjustment":adj}
+async def generate_signal(ticker,atype="stock",timeframe="swing",use_ai=False,use_advanced=True,use_mtf=True):
+    result=await _base_signal(ticker,atype,timeframe,use_ai=use_ai,allow_advanced=use_advanced)
+    if result.get("error"):
+        return result
+    if use_mtf:
+        mtf=await _mtf_confirm(ticker,atype,timeframe,result.get("signal"),result.get("confidence",0),use_ai=False)
+        result["mtf_confirmation"]=mtf
+        adj=float(mtf.get("confidence_adjustment",0) or 0)
+        result["confidence"]=int(max(0,min(100,float(result.get("confidence",0) or 0)+adj)))
+        result["calibration"]["mtf_adjustment"]=adj
+        result["calibration"]["after_mtf"]=result["confidence"]
+        if mtf.get("decision")=="blocked_by_mtf_opposition" and result["confidence"]<65:
+            result["signal"]="HOLD"; result["blocked_by_mtf"]=True
+        elif result["confidence"]<40:
+            result["signal"]="HOLD"
+    else:
+        result["mtf_confirmation"]={"enabled":False,"decision":"disabled"}
     if use_advanced:
         try:
             from services.meta_learner import predict_signal_quality
             meta=await predict_signal_quality(result); result["meta_learner"]=meta
             if meta.get("available"):
                 boost=meta.get("boost",0); result["confidence"]=max(0,min(100,result["confidence"]+boost)); result["calibration"]["meta_boost"]=boost; result["calibration"]["final_after_meta"]=result["confidence"]
-                if result["confidence"]<40 and sig!="HOLD": result["signal"]="HOLD"
+                if result["confidence"]<40 and result.get("signal")!="HOLD": result["signal"]="HOLD"
         except Exception as e: result["meta_learner"]={"error":str(e)}
     return result
