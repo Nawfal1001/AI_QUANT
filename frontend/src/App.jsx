@@ -22,6 +22,7 @@ import Settings from '@/pages/Settings'
 import Research from '@/pages/Research'
 import StrategyLab from '@/pages/StrategyLab'
 import Bots from '@/pages/Bots'
+import Calendar from '@/pages/Calendar'
 import Logs from '@/pages/Logs'
 
 export default function App() {
@@ -47,22 +48,23 @@ export default function App() {
           <Route path="/auth" element={<AuthPage />} />
           <Route path="/" element={<ProtectedRoute><Layout /></ProtectedRoute>}>
             <Route index element={<Navigate to="/dashboard" replace />} />
-            <Route path="dashboard" element={<Dashboard />} />
-            <Route path="portfolio" element={<Portfolio />} />
-            <Route path="signals" element={<Signals />} />
-            <Route path="strategy" element={<StrategyDashboard />} />
-            <Route path="quant" element={<QuantDashboard />} />
+            <Route path="dashboard"  element={<Dashboard />} />
+            <Route path="portfolio"  element={<Portfolio />} />
+            <Route path="signals"    element={<Signals />} />
+            <Route path="strategy"   element={<StrategyDashboard />} />
+            <Route path="quant"      element={<QuantDashboard />} />
             <Route path="autotrader" element={<AutoTrader />} />
-            <Route path="learning" element={<Learning />} />
-            <Route path="backtest" element={<Backtest />} />
-            <Route path="rewards" element={<Rewards />} />
-            <Route path="brokers" element={<Brokers />} />
-            <Route path="alerts" element={<Alerts />} />
-            <Route path="settings" element={<Settings />} />
-            <Route path="research" element={<Research />} />
+            <Route path="learning"   element={<Learning />} />
+            <Route path="backtest"   element={<Backtest />} />
+            <Route path="rewards"    element={<Rewards />} />
+            <Route path="brokers"    element={<Brokers />} />
+            <Route path="alerts"     element={<Alerts />} />
+            <Route path="settings"   element={<Settings />} />
+            <Route path="research"   element={<Research />} />
             <Route path="strategy-lab" element={<StrategyLab />} />
-            <Route path="bots" element={<Bots />} />
-            <Route path="logs" element={<Logs />} />
+            <Route path="bots"       element={<Bots />} />
+            <Route path="calendar"   element={<Calendar />} />
+            <Route path="logs"       element={<Logs />} />
           </Route>
           <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Routes>

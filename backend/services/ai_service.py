@@ -1,6 +1,9 @@
 from dotenv import load_dotenv
 
 from services.gemini_utils import clamp_number, gemini_available, get_model, json_only_guardrails, parse_json_object
+from services.logger import child as _child_log
+
+_log = _child_log("ai_service")
 
 load_dotenv()
 
@@ -18,7 +21,7 @@ def _bounded_signal_payload(payload):
 async def get_ai_signal(ticker, atype):
     fallback = {"score": 0, "reason": "AI unavailable", "confidence": 50, "time_horizon": "short_term", "risk_flags": []}
     if not gemini_available():
-        return fallback
+        return {**fallback, "reason": "AI unavailable: GEMINI_API_KEY not configured"}
     try:
         model = get_model()
         schema = '{"score": -1|0|1, "confidence": 0-100, "time_horizon": "intraday|short_term|swing", "risk_flags": ["string"], "reason": "under 25 words"}'
@@ -32,8 +35,9 @@ async def get_ai_signal(ticker, atype):
         prompt += f"\n\nAsset JSON: {{\"ticker\": \"{ticker}\", \"asset_type\": \"{atype}\"}}"
         response = model.generate_content(prompt)
         return _bounded_signal_payload(parse_json_object(response.text, fallback))
-    except Exception:
-        return fallback
+    except Exception as e:
+        _log.warning(f"get_ai_signal failed for {ticker}: {e}")
+        return {**fallback, "reason": f"AI error: {str(e)[:120]}"}
 
 
 async def get_ai_research(query, ticker=None, atype="stock"):

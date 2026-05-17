@@ -34,6 +34,12 @@ PRO_MODEL_ALIASES = {
 
 
 def get_gemini_api_key() -> str:
+    """Read the Gemini API key from any of the common env-var aliases.
+
+    Operators often set GEMINY_API_KEY (typo), GOOGLE_API_KEY, or
+    GOOGLE_GEMINI_API_KEY — every path here must use this helper, not raw
+    os.getenv, or AI silently falls back to rules without warning.
+    """
     return (
         os.getenv("GEMINI_API_KEY")
         or os.getenv("GEMINY_API_KEY")
@@ -44,10 +50,18 @@ def get_gemini_api_key() -> str:
 
 
 def get_gemini_model_name() -> str:
+    """Resolve the model name. Pro aliases fall through to Flash so a stale
+    GEMINI_MODEL=gemini-1.5-pro (which usually requires a billing-enabled
+    project) doesn't break free-tier deployments."""
     configured = (os.getenv("GEMINI_MODEL") or os.getenv("GEMINY_MODEL") or DEFAULT_GEMINI_MODEL).strip()
     if configured in PRO_MODEL_ALIASES or configured.endswith("-pro"):
         return DEFAULT_GEMINI_MODEL
     return configured or DEFAULT_GEMINI_MODEL
+
+
+# Back-compat alias used by services added in this branch.
+def get_model_name() -> str:
+    return get_gemini_model_name()
 
 
 def gemini_available() -> bool:
@@ -57,6 +71,36 @@ def gemini_available() -> bool:
 def get_model():
     genai.configure(api_key=get_gemini_api_key())
     return genai.GenerativeModel(get_gemini_model_name())
+
+
+def ping() -> Dict[str, Any]:
+    """Quick health check that exercises the API key + model. Used by /api/ai/status.
+
+    Returns {available: bool, model: str, reason: str, latency_ms: int, key_source: str}.
+    """
+    import time
+    out = {"available": False, "model": get_gemini_model_name(), "reason": "", "latency_ms": 0, "key_source": ""}
+    key = get_gemini_api_key()
+    if not key:
+        out["reason"] = "GEMINI_API_KEY (or GEMINY_API_KEY / GOOGLE_API_KEY / GOOGLE_GEMINI_API_KEY) is not set"
+        return out
+    # Report which env var the key came from (without leaking the key itself).
+    for name in ("GEMINI_API_KEY", "GEMINY_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GEMINI_API_KEY"):
+        if os.getenv(name, "").strip() == key:
+            out["key_source"] = name
+            break
+    try:
+        t0 = time.time()
+        model = get_model()
+        resp = model.generate_content('Reply with the JSON: {"ok":true}')
+        out["latency_ms"] = int((time.time() - t0) * 1000)
+        text = (resp.text or "").strip()
+        out["available"] = "ok" in text.lower() or "true" in text.lower()
+        out["reason"] = "Connected" if out["available"] else f"Unexpected response: {text[:120]}"
+        return out
+    except Exception as e:
+        out["reason"] = f"Gemini API error: {str(e)[:200]}"
+        return out
 
 
 def parse_json_object(text: str, fallback: Dict[str, Any]) -> Dict[str, Any]:
