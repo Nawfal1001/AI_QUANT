@@ -12,11 +12,11 @@ from functools import partial
 from typing import Dict
 
 import ccxt
-import google.generativeai as genai
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
+from services.gemini_utils import gemini_available, get_model
 from services.logger import child
 
 log = child("market_context")
@@ -178,12 +178,10 @@ def _deterministic_adjustment(mtf: Dict, corr: Dict, deriv: Dict, asset_type: st
 
 
 def _ai_adjustment(symbol: str, asset_type: str, features: Dict, fallback: int) -> Dict:
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        return {"confidence_adjustment": fallback, "source": "deterministic", "reason": "Gemini unavailable"}
+    if not gemini_available():
+        return {"confidence_adjustment": fallback, "source": "deterministic", "reason": "Gemini API key not configured"}
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))
+        model = get_model()
         prompt = (
             "You are a trading signal confidence calibration model. "
             "You must not create a trade signal. Only score the reliability of the existing market context. "

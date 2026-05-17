@@ -38,9 +38,43 @@ def gemini_available() -> bool:
     return bool(get_gemini_api_key())
 
 
+def get_model_name() -> str:
+    return os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+
+
 def get_model():
     genai.configure(api_key=get_gemini_api_key())
-    return genai.GenerativeModel(os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))
+    return genai.GenerativeModel(get_model_name())
+
+
+def ping() -> Dict[str, Any]:
+    """Quick health check that exercises the API key + model. Used by /api/ai/status.
+
+    Returns {available: bool, model: str, reason: str, latency_ms: int, key_source: str}.
+    """
+    import time
+    out = {"available": False, "model": get_model_name(), "reason": "", "latency_ms": 0, "key_source": ""}
+    key = get_gemini_api_key()
+    if not key:
+        out["reason"] = "GEMINI_API_KEY (or GEMINY_API_KEY / GOOGLE_API_KEY / GOOGLE_GEMINI_API_KEY) is not set"
+        return out
+    # Report which env var the key came from (without leaking the key itself).
+    for name in ("GEMINI_API_KEY", "GEMINY_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GEMINI_API_KEY"):
+        if os.getenv(name, "").strip() == key:
+            out["key_source"] = name
+            break
+    try:
+        t0 = time.time()
+        model = get_model()
+        resp = model.generate_content('Reply with the JSON: {"ok":true}')
+        out["latency_ms"] = int((time.time() - t0) * 1000)
+        text = (resp.text or "").strip()
+        out["available"] = "ok" in text.lower() or "true" in text.lower()
+        out["reason"] = "Connected" if out["available"] else f"Unexpected response: {text[:120]}"
+        return out
+    except Exception as e:
+        out["reason"] = f"Gemini API error: {str(e)[:200]}"
+        return out
 
 
 def parse_json_object(text: str, fallback: Dict[str, Any]) -> Dict[str, Any]:

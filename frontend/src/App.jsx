@@ -22,6 +22,7 @@ import Settings from '@/pages/Settings'
 import Research from '@/pages/Research'
 import StrategyLab from '@/pages/StrategyLab'
 import Bots from '@/pages/Bots'
+import Calendar from '@/pages/Calendar'
 
 export default function App() {
   const { validateToken, booting, booted } = useAuthStore()
@@ -64,6 +65,7 @@ export default function App() {
           <Route path="research"   element={<Research />} />
           <Route path="strategy-lab" element={<StrategyLab />} />
           <Route path="bots"       element={<Bots />} />
+          <Route path="calendar"   element={<Calendar />} />
         </Route>
         <Route path="*" element={<Navigate to="/dashboard" replace />} />
       </Routes>

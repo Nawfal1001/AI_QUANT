@@ -4,7 +4,7 @@ import { useStore } from '@/store'
 import { useAuthStore } from '@/store/auth'
 import { useLivePrices } from '@/hooks/useLivePrices'
 import { SafetyBar } from '@/components/SafetyBar'
-import { LayoutDashboard, Briefcase, Zap, Brain, Calculator, Bot, BarChart2, Trophy, Link2, Bell, Settings, ChevronRight, TrendingUp, LogOut, Activity, Search, Menu, X, FlaskConical, Cpu } from 'lucide-react'
+import { LayoutDashboard, Briefcase, Zap, Brain, Calculator, Bot, BarChart2, Trophy, Link2, Bell, Settings, ChevronRight, TrendingUp, LogOut, Activity, Search, Menu, X, FlaskConical, Cpu, Calendar as CalendarIcon } from 'lucide-react'
 
 const NAV = [
   { to: '/dashboard',   icon: LayoutDashboard, label: 'Dashboard'   },
@@ -18,6 +18,7 @@ const NAV = [
   { to: '/learning',    icon: Activity,         label: 'Self-Learning' },
   { to: '/backtest',    icon: BarChart2,        label: 'Backtest'    },
   { to: '/research',    icon: Search,           label: 'AI Research' },
+  { to: '/calendar',    icon: CalendarIcon,     label: 'Calendar'    },
   { to: '/rewards',     icon: Trophy,           label: 'Rewards'     },
   { to: '/brokers',     icon: Link2,            label: 'Brokers'     },
   { to: '/alerts',      icon: Bell,             label: 'Alerts'      },

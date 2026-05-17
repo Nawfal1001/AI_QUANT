@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
 import feedparser
 
 from database import db
+from services.gemini_utils import gemini_available, get_gemini_api_key, get_model
 from services.logger import child
 
 log = child("macro_analyzer")
@@ -201,14 +202,13 @@ async def analyze_macro_impact(headlines: Optional[List[str]] = None, use_ai: bo
         headlines = await fetch_macro_headlines()
 
     base = _rule_based_macro_analysis(headlines)
-    if not use_ai or not os.getenv("GEMINI_API_KEY"):
+    # Use the alias-aware helper so GEMINY_API_KEY / GOOGLE_API_KEY are honored too.
+    if not use_ai or not gemini_available():
         await col_macro_events.insert_one(dict(base))
         return base
 
     try:
-        import google.generativeai as genai
-        genai.configure(api_key=os.getenv("GEMINI_API_KEY", ""))
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = get_model()
         prompt = f"""
 You are a macro trading analyst. Analyze these headlines and infer likely cross-asset flows.
 Return JSON only with this exact shape:
