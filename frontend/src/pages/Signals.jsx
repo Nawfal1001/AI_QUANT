@@ -333,13 +333,122 @@ function SingleScanner() {
   )
 }
 
+// ─── Watchlist Scanner tab ────────────────────────────────────────────────────
+function WatchlistScanner() {
+  const [tickers,   setTickers]   = useState('AAPL, NVDA, TSLA, MSFT, BTC')
+  const [atype,     setAtype]     = useState('stock')
+  const [timeframe, setTimeframe] = useState('swing')
+  const [minConf,   setMinConf]   = useState(55)
+  const [result,    setResult]    = useState(null)
+  const [loading,   setLoading]   = useState(false)
+
+  async function scan() {
+    const cleaned = tickers.split(',').map(t => t.trim().toUpperCase()).filter(Boolean).join(',')
+    if (!cleaned) return
+    setLoading(true)
+    try {
+      const res = await api.get(
+        `/signals/scan/watchlist?tickers=${encodeURIComponent(cleaned)}&asset_type=${atype}&timeframe=${timeframe}&min_confidence=${minConf}`
+      )
+      setResult(res.data)
+    } catch (e) { console.error(e) }
+    setLoading(false)
+  }
+
+  const signals = result?.signals || []
+  const buys  = signals.filter(s => s.signal?.includes('BUY'))
+  const sells = signals.filter(s => s.signal?.includes('SELL'))
+
+  return (
+    <div>
+      <div style={{ ...card, marginBottom: 14 }}>
+        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+          <div style={{ flex: 1, minWidth: 260 }}>
+            <div style={{ fontSize: 11, color: '#8b949e', marginBottom: 4 }}>TICKERS (comma separated, max 50)</div>
+            <input value={tickers} onChange={e => setTickers(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && scan()}
+              style={{ width: '100%', background: '#0d1117', border: '1px solid #21262d', borderRadius: 7,
+                padding: '8px 12px', color: '#e2e8f0', fontSize: 13, outline: 'none', boxSizing: 'border-box' }}
+              placeholder="AAPL, NVDA, BTC, ETH, ..." />
+          </div>
+          <div>
+            <div style={{ fontSize: 11, color: '#8b949e', marginBottom: 4 }}>ASSET TYPE</div>
+            <select value={atype} onChange={e => setAtype(e.target.value)}
+              style={{ background: '#0d1117', border: '1px solid #21262d', borderRadius: 7, padding: '8px 10px', color: '#e2e8f0', fontSize: 13, outline: 'none' }}>
+              {['stock','crypto','forex'].map(t => <option key={t} value={t}>{t}</option>)}
+            </select>
+          </div>
+          <div>
+            <div style={{ fontSize: 11, color: '#8b949e', marginBottom: 4 }}>TIMEFRAME</div>
+            <select value={timeframe} onChange={e => setTimeframe(e.target.value)}
+              style={{ background: '#0d1117', border: '1px solid #21262d', borderRadius: 7, padding: '8px 10px', color: '#e2e8f0', fontSize: 13, outline: 'none' }}>
+              {['scalping','intraday','swing','position'].map(t => <option key={t} value={t}>{t}</option>)}
+            </select>
+          </div>
+          <div>
+            <div style={{ fontSize: 11, color: '#8b949e', marginBottom: 4 }}>MIN CONF</div>
+            <select value={minConf} onChange={e => setMinConf(Number(e.target.value))}
+              style={{ background: '#0d1117', border: '1px solid #21262d', borderRadius: 7, padding: '8px 10px', color: '#e2e8f0', fontSize: 13, outline: 'none' }}>
+              {[50,55,60,65,70].map(v => <option key={v} value={v}>{v}%+</option>)}
+            </select>
+          </div>
+          <button onClick={scan} disabled={loading}
+            style={{ padding: '9px 20px', borderRadius: 7, border: 'none', background: loading ? '#21262d' : '#1f6feb',
+              color: loading ? '#8b949e' : '#fff', fontWeight: 600, fontSize: 13,
+              cursor: loading ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', gap: 6 }}>
+            <Search size={13} />{loading ? 'Scanning…' : 'Scan'}
+          </button>
+        </div>
+      </div>
+
+      {result && (
+        <div style={{ display: 'flex', gap: 12, marginBottom: 14, flexWrap: 'wrap' }}>
+          {[['Scanned', result.scanned, '#8b949e'], ['Found', result.found, '#e3b341'],
+            ['BUY', buys.length, '#3fb950'], ['SELL', sells.length, '#f85149']].map(([l,v,c]) => (
+            <div key={l} style={{ ...card, padding: '10px 16px', flex: '0 0 auto' }}>
+              <div style={{ fontSize: 10, color: '#8b949e', marginBottom: 2 }}>{l}</div>
+              <div style={{ fontSize: 16, fontWeight: 700, color: c }}>{v}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {loading && !result && (
+        <div style={{ ...card, textAlign: 'center', color: '#8b949e', padding: 40 }}>
+          <RefreshCw size={22} style={{ animation: 'spin 1s linear infinite', marginBottom: 10 }} />
+          <div>Scanning your watchlist…</div>
+        </div>
+      )}
+      {result && signals.length === 0 && (
+        <div style={{ ...card, textAlign: 'center', color: '#8b949e', padding: 40 }}>
+          No signals above {minConf}% found. Try lowering the minimum confidence.
+        </div>
+      )}
+      {signals.length > 0 && (
+        <div style={card}>
+          <div style={{ display: 'grid', gridTemplateColumns: '36px 80px 80px 1fr 120px 90px 90px 90px',
+            gap: 10, padding: '6px 12px 10px', borderBottom: '1px solid #21262d' }}>
+            {['#','TICKER','SIDE','CONFIDENCE','PRICE','TP','SL','TYPE'].map(h => (
+              <div key={h} style={{ fontSize: 10, color: '#8b949e', fontWeight: 600,
+                textAlign: h === '#' || h === 'PRICE' || h === 'TP' || h === 'SL' ? 'center' : 'left' }}>{h}</div>
+            ))}
+          </div>
+          {signals.map((s, i) => <SignalRow key={`${s.ticker}-${i}`} s={s} i={i} total={signals.length} />)}
+        </div>
+      )}
+      <style>{`@keyframes spin { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }`}</style>
+    </div>
+  )
+}
+
 // ─── Main page ────────────────────────────────────────────────────────────────
 export default function Signals() {
-  const [tab, setTab] = useState('universe') // universe | single
+  const [tab, setTab] = useState('universe') // universe | watchlist | single
 
   const tabs = [
-    { id: 'universe', label: 'Universe Scanner', icon: <Globe size={13} /> },
-    { id: 'single',   label: 'Single Ticker',    icon: <Search size={13} /> },
+    { id: 'universe',  label: 'Universe Scanner', icon: <Globe size={13} /> },
+    { id: 'watchlist', label: 'Watchlist',         icon: <List size={13} /> },
+    { id: 'single',    label: 'Single Ticker',     icon: <Search size={13} /> },
   ]
 
   return (
@@ -366,7 +475,9 @@ export default function Signals() {
         </div>
       </div>
 
-      {tab === 'universe' ? <UniverseScanner /> : <SingleScanner />}
+      {tab === 'universe'  && <UniverseScanner />}
+      {tab === 'watchlist' && <WatchlistScanner />}
+      {tab === 'single'    && <SingleScanner />}
     </div>
   )
 }

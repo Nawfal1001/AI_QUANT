@@ -8,17 +8,36 @@ from functools import partial
 
 def _fetch(ticker, atype, period=60):
     try:
-        if atype=="stock":
-            h = yf.Ticker(ticker).history(period="3mo",interval="1d")
-            if h.empty: return pd.DataFrame()
-            df = h[["Open","High","Low","Close","Volume"]].copy()
+        if atype == "stock":
+            # Check signal_service cache first (avoids redundant downloads during scans)
+            try:
+                from services.signal_service import _cache_get
+                cached = _cache_get(ticker, atype)
+                if cached is not None and not cached.empty:
+                    return cached.tail(period)
+            except Exception:
+                pass
+            h = yf.download(ticker, period="3mo", interval="1d",
+                            auto_adjust=True, progress=False, threads=False)
+            if isinstance(h.columns, pd.MultiIndex):
+                h.columns = h.columns.droplevel(1)
+            if h.empty:
+                h = yf.Ticker(ticker).history(period="3mo", interval="1d", auto_adjust=True)
+            if h.empty:
+                return pd.DataFrame()
+            h.columns = [c.lower() for c in h.columns]
+            needed = [c for c in ["open","high","low","close","volume"] if c in h.columns]
+            if len(needed) < 5:
+                return pd.DataFrame()
+            df = h[needed].copy()
             df.columns = ["open","high","low","close","volume"]
             return df.dropna().tail(period)
         else:
-            ohlcv = ccxt.binance().fetch_ohlcv(f"{ticker}/USDT","1d",limit=period)
-            df = pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","volume"])
+            ohlcv = ccxt.binance().fetch_ohlcv(f"{ticker}/USDT", "1d", limit=period)
+            df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
             return df[["open","high","low","close","volume"]].dropna()
-    except: return pd.DataFrame()
+    except Exception as e:
+        return pd.DataFrame()
 
 def compute_volume_profile(df, bins=24):
     """Compute volume distribution across price levels"""

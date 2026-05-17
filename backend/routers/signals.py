@@ -3,48 +3,68 @@ import asyncio
 from datetime import datetime
 from fastapi import APIRouter, Depends
 
-from services.signal_service import generate_signal
+from services.signal_service import generate_signal, batch_prefetch_stocks_async
 from services import signal_tracker
 from middleware.auth import get_current_user
 
 router = APIRouter()
 
-# ── Universe definitions ──────────────────────────────────────────────────────
+# ── Universe definitions (deduped, verified tickers) ─────────────────────────
 STOCK_UNIVERSE = [
     # Mega-cap tech
     "AAPL","NVDA","MSFT","AMZN","META","GOOGL","TSLA","AMD","INTC","ORCL",
     # Finance
-    "JPM","GS","MS","V","MA","BAC","WFC","BRK-B",
+    "JPM","GS","MS","V","MA","BAC","WFC",
     # Consumer / Retail
-    "NFLX","DIS","AMZN","WMT","COST","TGT","NKE","SBUX",
+    "NFLX","DIS","WMT","COST","TGT","NKE","SBUX",
     # Healthcare / Biotech
     "JNJ","PFE","MRNA","ABBV","UNH","CVS",
     # Energy / Industrial
     "XOM","CVX","BA","CAT","GE","HON",
     # Fintech / Growth
-    "PYPL","SQ","COIN","SHOP","UBER","LYFT","SNAP","RBLX","PLTR","HOOD",
+    "PYPL","SQ","COIN","SHOP","UBER","SNAP","RBLX","PLTR","HOOD",
     # ETFs
     "SPY","QQQ","IWM","ARKK","XLF","XLE",
-    # High-movers
-    "GME","AMC","BBBY","SOFI","RIVN","LCID",
+    # High-volatility
+    "GME","AMC","SOFI","RIVN","LCID",
 ]
 
 CRYPTO_UNIVERSE = [
     "BTC","ETH","SOL","BNB","ADA","XRP","DOGE","AVAX","MATIC","DOT",
-    "LINK","UNI","LTC","ATOM","FIL","NEAR","APT","ARB","OP",
+    "LINK","UNI","LTC","ATOM","NEAR",
 ]
 
 FOREX_UNIVERSE = [
     "EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","USDCAD=X","USDCHF=X",
 ]
 
+# Limit concurrent signal generations to avoid thread-pool saturation
+_SCAN_SEM = asyncio.Semaphore(12)
 
-async def _scan_items(items, timeframe, min_confidence, user_id):
-    """Scan a list of (ticker, asset_type) pairs, log actionable signals, return sorted list."""
+
+async def _gen_one(ticker, atype, timeframe, use_advanced):
+    """Generate signal for one ticker, respecting the concurrency semaphore."""
+    async with _SCAN_SEM:
+        return await generate_signal(ticker, atype, timeframe, use_advanced=use_advanced)
+
+
+async def _scan_items(items, timeframe, min_confidence, user_id, use_advanced=False):
+    """
+    Scan a list of (ticker, asset_type) pairs.
+    - Batch-prefetches all stock OHLCV before generating signals (10-30× faster).
+    - Limits concurrency to _SCAN_SEM slots.
+    - use_advanced=False skips LLM/microstructure/confluence overhead for speed.
+    """
+    # Batch prefetch all stock tickers at once (single yf.download call)
+    stock_tickers = [t for t, at in items if at == "stock"]
+    if stock_tickers:
+        await batch_prefetch_stocks_async(stock_tickers)
+
     results = await asyncio.gather(
-        *[generate_signal(t, at, timeframe) for t, at in items],
+        *[_gen_one(t, at, timeframe, use_advanced) for t, at in items],
         return_exceptions=True,
     )
+
     out = []
     for (ticker, atype), r in zip(items, results):
         if isinstance(r, Exception) or not r:
@@ -54,7 +74,6 @@ async def _scan_items(items, timeframe, min_confidence, user_id):
         if r.get("confidence", 0) < min_confidence:
             continue
         r["asset_type"] = atype
-        # log to signal tracker
         try:
             await signal_tracker.log_signal(
                 user_id=user_id,
@@ -90,9 +109,9 @@ async def scan_universe(
     if asset_type in ("crypto", "all"):
         items += [(t, "crypto") for t in CRYPTO_UNIVERSE]
     if asset_type == "forex":
-        items += [(t, "stock") for t in FOREX_UNIVERSE]  # yfinance handles forex tickers
+        items += [(t, "stock") for t in FOREX_UNIVERSE]
 
-    signals = await _scan_items(items, timeframe, min_confidence, user["id"])
+    signals = await _scan_items(items, timeframe, min_confidence, user["id"], use_advanced=False)
     return {
         "scanned": len(items),
         "found": len(signals),
@@ -116,7 +135,7 @@ async def scan_watchlist(
     if not ticker_list:
         return {"signals": [], "scanned": 0, "found": 0}
     items = [(t, asset_type) for t in ticker_list[:50]]
-    signals = await _scan_items(items, timeframe, min_confidence, user["id"])
+    signals = await _scan_items(items, timeframe, min_confidence, user["id"], use_advanced=False)
     return {
         "scanned": len(items),
         "found": len(signals),

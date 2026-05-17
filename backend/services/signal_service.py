@@ -4,7 +4,7 @@ TradeAI Signal Service v4.3
 + Meta-Learner boost + Confluence Memory + LLM Sentiment + Volume Profile + Microstructure
 + Bayesian voting (regime-conditional)
 """
-import asyncio, numpy as np, pandas as pd, ta, yfinance as yf, ccxt
+import asyncio, time, numpy as np, pandas as pd, ta, yfinance as yf, ccxt
 from datetime import datetime
 from functools import partial
 from database import db
@@ -16,31 +16,98 @@ _log = _child_log('signal_service')
 
 TF = {"scalping":{"period":50,"atr":14,"sl":0.5,"tp":1.0},"intraday":{"period":100,"atr":14,"sl":1.0,"tp":2.0},"swing":{"period":200,"atr":14,"sl":1.5,"tp":3.0},"position":{"period":300,"atr":14,"sl":2.0,"tp":4.0}}
 
+# ── In-memory OHLCV cache (populated by batch prefetch for universe scans) ────
+_OHLCV_CACHE: dict = {}   # key: "TICKER_atype" → (DataFrame, timestamp)
+_CACHE_TTL = 3600          # 1 hour
+
+def _cache_get(ticker: str, atype: str):
+    entry = _OHLCV_CACHE.get(f"{ticker}_{atype}")
+    if entry:
+        df, ts = entry
+        if time.time() - ts < _CACHE_TTL:
+            return df
+    return None
+
+def _cache_set(ticker: str, atype: str, df: pd.DataFrame):
+    _OHLCV_CACHE[f"{ticker}_{atype}"] = (df.copy(), time.time())
+
+
+def _normalize_ohlcv(h: pd.DataFrame) -> pd.DataFrame:
+    """Flatten multi-level columns (yfinance 0.2.38+), lowercase, return open/high/low/close/volume."""
+    if isinstance(h.columns, pd.MultiIndex):
+        h.columns = h.columns.droplevel(1)
+    h.columns = [c.lower() for c in h.columns]
+    needed = [c for c in ["open","high","low","close","volume"] if c in h.columns]
+    if len(needed) < 5:
+        return pd.DataFrame()
+    df = h[needed].copy()
+    df.columns = ["open","high","low","close","volume"]
+    return df.dropna()
+
+
+def _fetch_single_stock(ticker: str) -> pd.DataFrame:
+    """Download 1y of daily data for a single stock ticker."""
+    h = yf.download(ticker, period="1y", interval="1d",
+                    auto_adjust=True, progress=False, threads=False)
+    if h.empty:
+        h = yf.Ticker(ticker).history(period="1y", interval="1d", auto_adjust=True)
+    return _normalize_ohlcv(h)
+
+
+def batch_prefetch_stocks(tickers: list):
+    """
+    Download all stock tickers in a single yf.download() call and populate the cache.
+    Called from the universe scanner before spawning individual signal generators.
+    Using group_by='ticker' so we get one DataFrame per ticker.
+    """
+    if not tickers:
+        return
+    try:
+        df_all = yf.download(
+            tickers, period="1y", interval="1d",
+            auto_adjust=True, progress=False, threads=True, group_by="ticker",
+        )
+        if df_all.empty:
+            return
+        for ticker in tickers:
+            try:
+                if len(tickers) == 1:
+                    df = _normalize_ohlcv(df_all)
+                elif isinstance(df_all.columns, pd.MultiIndex):
+                    df = df_all[ticker].copy() if ticker in df_all.columns.get_level_values(0) else pd.DataFrame()
+                    df = _normalize_ohlcv(df) if not df.empty else df
+                else:
+                    df = _normalize_ohlcv(df_all)
+                if not df.empty:
+                    _cache_set(ticker, "stock", df)
+            except Exception as e:
+                _log.debug(f"batch_prefetch {ticker}: {e}")
+    except Exception as e:
+        _log.debug(f"batch_prefetch error: {e}")
+
+
+async def batch_prefetch_stocks_async(tickers: list):
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, batch_prefetch_stocks, tickers)
+
+
 def _fetch(ticker, atype, period):
     try:
         if atype == "stock":
-            # Try yf.download first (more reliable in yfinance 0.2.38+)
-            h = yf.download(ticker, period="1y", interval="1d",
-                            auto_adjust=True, progress=False, threads=False)
-            if isinstance(h.columns, pd.MultiIndex):
-                h.columns = h.columns.droplevel(1)
-            if h.empty:
-                # fallback to Ticker.history
-                h = yf.Ticker(ticker).history(period="1y", interval="1d", auto_adjust=True)
-            if h.empty:
+            # Check cache first (populated by batch_prefetch for universe scans)
+            cached = _cache_get(ticker, atype)
+            if cached is not None and not cached.empty:
+                return cached.tail(period)
+            # Individual download fallback
+            df = _fetch_single_stock(ticker)
+            if df.empty:
                 return pd.DataFrame()
-            # Normalize to lowercase column names
-            h.columns = [c.lower() for c in h.columns]
-            needed = [c for c in ["open","high","low","close","volume"] if c in h.columns]
-            if len(needed) < 5:
-                return pd.DataFrame()
-            df = h[needed].copy()
-            df.columns = ["open","high","low","close","volume"]
-            return df.dropna().tail(period)
+            _cache_set(ticker, atype, df)
+            return df.tail(period)
         else:
-            ohlcv = ccxt.binance().fetch_ohlcv(f"{ticker}/USDT", "1d", limit=period)
+            ohlcv = ccxt.binance().fetch_ohlcv(f"{ticker}/USDT", "1d", limit=max(period, 100))
             df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
-            return df[["open","high","low","close","volume"]].dropna()
+            return df[["open","high","low","close","volume"]].dropna().tail(period)
     except Exception as e:
         _log.debug(f"_fetch {ticker} {atype} error: {e}")
         return pd.DataFrame()

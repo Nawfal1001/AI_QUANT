@@ -30,16 +30,25 @@ DEFAULT_SPREAD_BPS = 2
 def _fetch_stock_history(ticker, start, end, interval="1d"):
     try:
         import yfinance as yf
-        t = yf.Ticker(ticker)
-        hist = t.history(start=start, end=end, interval=interval)
+        hist = yf.download(ticker, start=start, end=end, interval=interval,
+                           auto_adjust=True, progress=False, threads=False)
+        if isinstance(hist.columns, pd.MultiIndex):
+            hist.columns = hist.columns.droplevel(1)
+        if hist.empty:
+            hist = yf.Ticker(ticker).history(start=start, end=end, interval=interval, auto_adjust=True)
         if hist.empty:
             return None
+        hist.columns = [c.lower() for c in hist.columns]
         hist = hist.reset_index()
-        date_col = "Date" if "Date" in hist.columns else "Datetime"
-        hist["Date"] = pd.to_datetime(hist[date_col])
-        return hist[["Date", "Open", "High", "Low", "Close", "Volume"]].rename(
-            columns={"Date": "date", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
-        )
+        date_col = next((c for c in hist.columns if "date" in c.lower()), hist.columns[0])
+        hist[date_col] = pd.to_datetime(hist[date_col])
+        col_map = {date_col: "date"}
+        for c in ["open","high","low","close","volume"]:
+            match = next((x for x in hist.columns if x.lower() == c), None)
+            if match:
+                col_map[match] = c
+        hist = hist.rename(columns=col_map)
+        return hist[["date","open","high","low","close","volume"]]
     except Exception as e:
         log.exception(f"yfinance fetch failed for {ticker}: {e}")
         return None
