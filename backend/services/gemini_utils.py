@@ -22,9 +22,24 @@ Think like a professional desk analyst:
 - Never pretend to have live data unless the provided input includes it.
 """.strip()
 
+DEFAULT_GEMINI_MODEL = "gemini-1.5-flash"
+PRO_MODEL_ALIASES = {
+    "gemini-pro",
+    "gemini-1.0-pro",
+    "gemini-1.5-pro",
+    "models/gemini-pro",
+    "models/gemini-1.0-pro",
+    "models/gemini-1.5-pro",
+}
+
 
 def get_gemini_api_key() -> str:
-    # Accept common misspellings/aliases used in deployment dashboards.
+    """Read the Gemini API key from any of the common env-var aliases.
+
+    Operators often set GEMINY_API_KEY (typo), GOOGLE_API_KEY, or
+    GOOGLE_GEMINI_API_KEY — every path here must use this helper, not raw
+    os.getenv, or AI silently falls back to rules without warning.
+    """
     return (
         os.getenv("GEMINI_API_KEY")
         or os.getenv("GEMINY_API_KEY")
@@ -34,17 +49,28 @@ def get_gemini_api_key() -> str:
     ).strip()
 
 
+def get_gemini_model_name() -> str:
+    """Resolve the model name. Pro aliases fall through to Flash so a stale
+    GEMINI_MODEL=gemini-1.5-pro (which usually requires a billing-enabled
+    project) doesn't break free-tier deployments."""
+    configured = (os.getenv("GEMINI_MODEL") or os.getenv("GEMINY_MODEL") or DEFAULT_GEMINI_MODEL).strip()
+    if configured in PRO_MODEL_ALIASES or configured.endswith("-pro"):
+        return DEFAULT_GEMINI_MODEL
+    return configured or DEFAULT_GEMINI_MODEL
+
+
+# Back-compat alias used by services added in this branch.
+def get_model_name() -> str:
+    return get_gemini_model_name()
+
+
 def gemini_available() -> bool:
     return bool(get_gemini_api_key())
 
 
-def get_model_name() -> str:
-    return os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-
-
 def get_model():
     genai.configure(api_key=get_gemini_api_key())
-    return genai.GenerativeModel(get_model_name())
+    return genai.GenerativeModel(get_gemini_model_name())
 
 
 def ping() -> Dict[str, Any]:
@@ -53,7 +79,7 @@ def ping() -> Dict[str, Any]:
     Returns {available: bool, model: str, reason: str, latency_ms: int, key_source: str}.
     """
     import time
-    out = {"available": False, "model": get_model_name(), "reason": "", "latency_ms": 0, "key_source": ""}
+    out = {"available": False, "model": get_gemini_model_name(), "reason": "", "latency_ms": 0, "key_source": ""}
     key = get_gemini_api_key()
     if not key:
         out["reason"] = "GEMINI_API_KEY (or GEMINY_API_KEY / GOOGLE_API_KEY / GOOGLE_GEMINI_API_KEY) is not set"

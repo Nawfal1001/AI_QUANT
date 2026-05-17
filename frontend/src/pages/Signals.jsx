@@ -1,136 +1,23 @@
-import React, { useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { api } from '@/store/auth'
-import { Search, Zap, Info } from 'lucide-react'
-const card = { background: '#161b22', border: '1px solid #21262d', borderRadius: 12, padding: '16px 18px' }
-const sig_color = (s) => s?.includes('BUY') ? '#3fb950' : s?.includes('SELL') ? '#f85149' : '#8b949e'
-const sig_bg = (s) => s?.includes('BUY') ? 'rgba(63,185,80,0.12)' : s?.includes('SELL') ? 'rgba(248,81,73,0.12)' : 'rgba(139,148,158,0.1)'
-
-export default function Signals() {
-  const [ticker,  setTicker]  = useState('AAPL')
-  const [atype,   setAtype]   = useState('stock')
-  const [tf,      setTf]      = useState('swing')
-  const [signal,  setSignal]  = useState(null)
-  const [loading, setLoading] = useState(false)
-  const [multitf, setMultiTf] = useState(null)
-  const [mode,    setMode]    = useState('single') // single | multi | opportunities
-
-  async function run() {
-    if (!ticker) return
-    setLoading(true); setSignal(null); setMultiTf(null)
-    try {
-      if (mode === 'multi') {
-        const res = await api.get(`/signals/multi/${ticker.toUpperCase()}?asset_type=${atype}`)
-        setMultiTf(res.data)
-      } else {
-        const res = await api.get(`/signals/${ticker.toUpperCase()}?asset_type=${atype}&timeframe=${tf}`)
-        setSignal(res.data)
-      }
-    } catch (e) { console.error(e) }
-    setLoading(false)
-  }
-
-  const ConfBar = ({ value, max = 100 }) => (
-    <div style={{ background: '#21262d', borderRadius: 4, height: 6, width: '100%', overflow: 'hidden' }}>
-      <div style={{ height: '100%', width: `${Math.min(100, (value / max) * 100)}%`, background: value > 60 ? '#3fb950' : value > 40 ? '#e3b341' : '#f85149', borderRadius: 4 }} />
-    </div>
-  )
-
-  return (
-    <div>
-      <h1 style={{ fontSize: 20, fontWeight: 700, color: '#e2e8f0', marginBottom: 20 }}>⚡ Signal Scanner</h1>
-
-      {/* Controls */}
-      <div style={{ ...card, marginBottom: 16 }}>
-        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'flex-end' }}>
-          <div>
-            <div style={{ fontSize: 11, color: '#8b949e', marginBottom: 4 }}>TICKER</div>
-            <input value={ticker} onChange={e => setTicker(e.target.value.toUpperCase())} onKeyDown={e => e.key === 'Enter' && run()}
-              style={{ background: '#0d1117', border: '1px solid #21262d', borderRadius: 7, padding: '8px 12px', color: '#e2e8f0', fontSize: 14, width: 110, outline: 'none' }} placeholder="AAPL" />
-          </div>
-          <div>
-            <div style={{ fontSize: 11, color: '#8b949e', marginBottom: 4 }}>ASSET</div>
-            <select value={atype} onChange={e => setAtype(e.target.value)}
-              style={{ background: '#0d1117', border: '1px solid #21262d', borderRadius: 7, padding: '8px 10px', color: '#e2e8f0', fontSize: 13, cursor: 'pointer', outline: 'none' }}>
-              {['stock', 'crypto', 'forex'].map(t => <option key={t} value={t}>{t}</option>)}
-            </select>
-          </div>
-          <div>
-            <div style={{ fontSize: 11, color: '#8b949e', marginBottom: 4 }}>TIMEFRAME</div>
-            <select value={tf} onChange={e => setTf(e.target.value)}
-              style={{ background: '#0d1117', border: '1px solid #21262d', borderRadius: 7, padding: '8px 10px', color: '#e2e8f0', fontSize: 13, cursor: 'pointer', outline: 'none' }}>
-              {['scalping', 'intraday', 'swing', 'position'].map(t => <option key={t} value={t}>{t}</option>)}
-            </select>
-          </div>
-          <div>
-            <div style={{ fontSize: 11, color: '#8b949e', marginBottom: 4 }}>MODE</div>
-            <select value={mode} onChange={e => setMode(e.target.value)}
-              style={{ background: '#0d1117', border: '1px solid #21262d', borderRadius: 7, padding: '8px 10px', color: '#e2e8f0', fontSize: 13, cursor: 'pointer', outline: 'none' }}>
-              <option value="single">Single TF</option>
-              <option value="multi">All Timeframes</option>
-            </select>
-          </div>
-          <button onClick={run} disabled={loading}
-            style={{ padding: '9px 20px', borderRadius: 7, border: 'none', background: loading ? '#21262d' : '#1f6feb', color: loading ? '#8b949e' : '#fff', fontWeight: 600, fontSize: 13, cursor: loading ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', gap: 6 }}>
-            <Search size={14} /> {loading ? 'Scanning...' : 'Scan Signal'}
-          </button>
-        </div>
-      </div>
-
-      {/* Single Signal Result */}
-      {signal && (
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
-          <div style={card}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 14 }}>
-              <div>
-                <div style={{ fontSize: 22, fontWeight: 700, color: '#e2e8f0' }}>{signal.ticker}</div>
-                <div style={{ fontSize: 12, color: '#8b949e' }}>${signal.price?.toFixed(4)} · {signal.timeframe} · {signal.regime}</div>
-              </div>
-              <div style={{ textAlign: 'right' }}>
-                <div style={{ fontSize: 16, fontWeight: 700, color: sig_color(signal.signal), background: sig_bg(signal.signal), padding: '4px 12px', borderRadius: 10 }}>{signal.signal}</div>
-                <div style={{ fontSize: 12, color: '#8b949e', marginTop: 4 }}>Confidence: {signal.confidence}%</div>
-              </div>
-            </div>
-            <ConfBar value={signal.confidence} />
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8, marginTop: 14 }}>
-              {[['Price', `$${signal.price}`], ['SL', `$${signal.sl}`], ['TP', `$${signal.tp}`], ['ATR', `$${signal.atr}`], ['Regime', signal.regime], ['Bayesian', `${Math.round(signal.bayesian?.p_buy * 100 || 50)}% BUY`]].map(([k, v]) => (
-                <div key={k} style={{ background: '#0d1117', borderRadius: 7, padding: '8px 10px' }}>
-                  <div style={{ fontSize: 10, color: '#8b949e' }}>{k}</div>
-                  <div style={{ fontSize: 12, color: '#e2e8f0', fontWeight: 500, marginTop: 2 }}>{v}</div>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          <div style={card}>
-            <div style={{ fontSize: 13, fontWeight: 600, color: '#e2e8f0', marginBottom: 12 }}>📊 Indicator Breakdown</div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 5, maxHeight: 320, overflowY: 'auto' }}>
-              {signal.indicators?.map((ind, i) => (
-                <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '5px 8px', background: '#0d1117', borderRadius: 6 }}>
-                  <div style={{ fontSize: 11, color: '#8b949e', flex: 1 }}>{ind.indicator}</div>
-                  <div style={{ fontSize: 11, color: sig_color(ind.signal), background: sig_bg(ind.signal), padding: '1px 7px', borderRadius: 8, marginRight: 6 }}>{ind.signal}</div>
-                  <div style={{ fontSize: 10, color: '#8b949e', maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{ind.reason}</div>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Multi-TF Results */}
-      {multitf && (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(240px,1fr))', gap: 14 }}>
-          {Object.entries(multitf).map(([tf, s]) => (
-            <div key={tf} style={card}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
-                <div style={{ fontSize: 13, fontWeight: 600, color: '#e2e8f0', textTransform: 'capitalize' }}>{tf}</div>
-                <div style={{ fontSize: 12, fontWeight: 600, color: sig_color(s.signal), background: sig_bg(s.signal), padding: '2px 10px', borderRadius: 10 }}>{s.signal}</div>
-              </div>
-              <ConfBar value={s.confidence} />
-              <div style={{ fontSize: 11, color: '#8b949e', marginTop: 8 }}>Confidence: {s.confidence}% · {s.regime}</div>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  )
+import { Search, RefreshCw } from 'lucide-react'
+const card={background:'#161b22',border:'1px solid #21262d',borderRadius:12,padding:'16px 18px'}
+const sig_color=s=>s?.includes('BUY')?'#3fb950':s?.includes('SELL')?'#f85149':'#8b949e'
+const sig_bg=s=>s?.includes('BUY')?'rgba(63,185,80,.12)':s?.includes('SELL')?'rgba(248,81,73,.12)':'rgba(139,148,158,.1)'
+const fmtMoney=(v,d=4)=>Number.isFinite(Number(v))?`$${Number(v).toFixed(d)}`:'—'
+const fmtPct=v=>Number.isFinite(Number(v))?`${Math.round(Number(v))}%`:'0%'
+const cleanSignal=s=>s||{signal:'HOLD',confidence:0,indicators:[],bayesian:{}}
+const reasonLabel=r=>({actionable:'Actionable',hold_signal:'Hold / no setup',below_min_confidence:'Below threshold',provider_or_signal_error:'Data or signal error'}[r]||r||'diagnostic')
+export default function Signals(){
+ const [ticker,setTicker]=useState('AAPL'),[atype,setAtype]=useState(''),[broker,setBroker]=useState(''),[execMode,setExecMode]=useState(''),[tf,setTf]=useState('swing'),[signal,setSignal]=useState(null),[loading,setLoading]=useState(false),[autoLoading,setAutoLoading]=useState(false),[multitf,setMultiTf]=useState(null),[autoSignals,setAutoSignals]=useState([]),[mode,setMode]=useState('auto'),[error,setError]=useState(''),[requestLogs,setRequestLogs]=useState([]),[scanJob,setScanJob]=useState(null),[scanProgress,setScanProgress]=useState(0),[scanStatus,setScanStatus]=useState('idle')
+ const pollRef=useRef(null)
+ function addLog(msg,level='info'){setRequestLogs(p=>[...p.slice(-150),{ts:new Date().toISOString(),msg,level}])}
+ async function loadAuto(){setAutoLoading(true);setError('');addLog('Loading auto universe signals...');try{const qs=new URLSearchParams();if(broker)qs.set('broker',broker);if(atype)qs.set('asset_type',atype);if(execMode)qs.set('execution_mode',execMode);qs.set('limit','100');const res=await api.get(`/auto-signals/latest?${qs.toString()}`);const rows=res.data?.signals||[];setAutoSignals(rows);addLog(`Loaded ${rows.length} ranked signals/candidates`,rows.length?'success':'warning')}catch(e){const m=e.response?.data?.detail||e.message||'Could not load auto universe signals';setError(m);addLog(m,'error')}finally{setAutoLoading(false)}}
+ async function pollScanJob(id){try{const r=await api.get(`/auto-signals/scan/jobs/${id}`);const j=r.data||{};setScanStatus(j.status||'unknown');setScanProgress(Number(j.progress||0));(j.logs||[]).slice(-20).forEach(l=>{if(!requestLogs.some(x=>x.msg===l.message&&x.ts===l.ts))addLog(l.message,l.level||'info')});if(j.status==='completed'){if(pollRef.current)clearInterval(pollRef.current);pollRef.current=null;setAutoLoading(false);addLog('Auto scan completed. Reloading ranked candidates...','success');await loadAuto()}if(j.status==='failed'){if(pollRef.current)clearInterval(pollRef.current);pollRef.current=null;setAutoLoading(false);const m=j.error||'Auto scan failed';setError(m);addLog(m,'error')}}catch(e){const m=e.response?.data?.detail||e.message||'Could not poll scan job';setError(m);addLog(m,'error')}}
+ async function forceAutoScan(){setAutoLoading(true);setError('');setScanProgress(0);setScanStatus('queued');addLog('Starting forced full auto scan...');try{const r=await api.post('/auto-signals/scan');const id=r.data?.job_id;setScanJob(id);addLog(`Scan job queued: ${id}`,'success');await pollScanJob(id);if(pollRef.current)clearInterval(pollRef.current);pollRef.current=setInterval(()=>pollScanJob(id),2000)}catch(e){const m=e.response?.data?.detail||e.message||'Auto universe scan failed';setError(m);addLog(m,'error');setAutoLoading(false)}}
+ useEffect(()=>{loadAuto();return()=>{if(pollRef.current)clearInterval(pollRef.current)}},[])
+ async function run(){if(mode==='auto')return loadAuto();if(!ticker)return;setLoading(true);setSignal(null);setMultiTf(null);setError('');addLog(`Scanning ${ticker.toUpperCase()} ${atype||'auto'} ${mode}`);try{if(mode==='multi'){const res=await api.get(`/signals/multi/${ticker.toUpperCase()}?asset_type=${atype||'crypto'}`);setMultiTf(res.data);addLog('Multi-timeframe signal scan completed','success')}else{const res=await api.get(`/signals/${ticker.toUpperCase()}?asset_type=${atype||'crypto'}&timeframe=${tf}&use_ai=true`);setSignal(cleanSignal(res.data));addLog(`${ticker.toUpperCase()} ${res.data?.signal||'HOLD'} confidence=${res.data?.confidence||0}`,'success');if(res.data?.error)setError(res.data.error)}}catch(e){const m=e.response?.data?.detail||e.message||'Signal request failed';setError(m);addLog(m,'error')}finally{setLoading(false)}}
+ const ConfBar=({value,max=100})=>{const n=Math.max(0,Math.min(100,Number(value)||0));return <div style={{background:'#21262d',borderRadius:4,height:6,width:'100%',overflow:'hidden'}}><div style={{height:'100%',width:`${Math.min(100,(n/max)*100)}%`,background:n>60?'#3fb950':n>40?'#e3b341':'#f85149',borderRadius:4}}/></div>}
+ const s=signal?cleanSignal(signal):null
+ return <div><h1 style={{fontSize:20,fontWeight:700,color:'#e2e8f0',marginBottom:20}}>⚡ Signal Scanner</h1><div style={{...card,marginBottom:16}}><div style={{display:'flex',gap:10,flexWrap:'wrap',alignItems:'flex-end'}}><div><div style={{fontSize:11,color:'#8b949e',marginBottom:4}}>MODE</div><select value={mode} onChange={e=>setMode(e.target.value)} style={{background:'#0d1117',border:'1px solid #21262d',borderRadius:7,padding:'8px 10px',color:'#e2e8f0',fontSize:13}}><option value="auto">Auto Universe</option><option value="single">Single TF</option><option value="multi">All Timeframes</option></select></div>{mode!=='auto'&&<div><div style={{fontSize:11,color:'#8b949e',marginBottom:4}}>TICKER</div><input value={ticker} onChange={e=>setTicker(e.target.value.toUpperCase())} onKeyDown={e=>e.key==='Enter'&&run()} style={{background:'#0d1117',border:'1px solid #21262d',borderRadius:7,padding:'8px 12px',color:'#e2e8f0',fontSize:14,width:110}}/></div>}<div><div style={{fontSize:11,color:'#8b949e',marginBottom:4}}>ASSET</div><select value={atype} onChange={e=>setAtype(e.target.value)} style={{background:'#0d1117',border:'1px solid #21262d',borderRadius:7,padding:'8px 10px',color:'#e2e8f0',fontSize:13}}><option value="">All assets</option>{['stock','crypto','forex'].map(t=><option key={t} value={t}>{t}</option>)}</select></div>{mode==='auto'&&<><div><div style={{fontSize:11,color:'#8b949e',marginBottom:4}}>BROKER</div><select value={broker} onChange={e=>setBroker(e.target.value)} style={{background:'#0d1117',border:'1px solid #21262d',borderRadius:7,padding:'8px 10px',color:'#e2e8f0',fontSize:13}}><option value="">All brokers</option><option value="fusion">Fusion</option><option value="paper">Paper</option><option value="alpaca">Alpaca</option><option value="binance">Binance</option><option value="oanda">Oanda</option></select></div><div><div style={{fontSize:11,color:'#8b949e',marginBottom:4}}>EXECUTION</div><select value={execMode} onChange={e=>setExecMode(e.target.value)} style={{background:'#0d1117',border:'1px solid #21262d',borderRadius:7,padding:'8px 10px',color:'#e2e8f0',fontSize:13}}><option value="">Paper + Live</option><option value="paper">Paper</option><option value="live">Live</option></select></div></>}{mode!=='auto'&&<div><div style={{fontSize:11,color:'#8b949e',marginBottom:4}}>TIMEFRAME</div><select value={tf} onChange={e=>setTf(e.target.value)} style={{background:'#0d1117',border:'1px solid #21262d',borderRadius:7,padding:'8px 10px',color:'#e2e8f0',fontSize:13}}>{['scalping','intraday','swing','position'].map(t=><option key={t} value={t}>{t}</option>)}</select></div>}<button onClick={run} disabled={loading||autoLoading} style={{padding:'9px 20px',borderRadius:7,border:'none',background:(loading||autoLoading)?'#21262d':'#1f6feb',color:'#fff',fontWeight:600,fontSize:13,display:'flex',alignItems:'center',gap:6}}><Search size={14}/> {(loading||autoLoading)?'Scanning...':mode==='auto'?'Load Auto Signals':'Scan Signal'}</button>{mode==='auto'&&<button onClick={forceAutoScan} disabled={autoLoading} style={{padding:'9px 14px',borderRadius:7,border:'1px solid #30363d',background:'#0d1117',color:'#e2e8f0',fontWeight:600,fontSize:13,display:'flex',alignItems:'center',gap:6}}><RefreshCw size={14}/> Force Scan</button>}</div>{autoLoading&&mode==='auto'&&<div style={{marginTop:12}}><div style={{fontSize:12,color:'#8b949e',marginBottom:5}}>Scan job {scanStatus} · {Math.round(scanProgress)}%</div><div style={{height:8,background:'#21262d',borderRadius:8,overflow:'hidden'}}><div style={{height:'100%',width:`${Math.min(100,scanProgress)}%`,background:'#1f6feb'}}/></div></div>}{error&&<div style={{marginTop:12,color:'#e3b341',fontSize:12}}>⚠ {error}</div>}</div>{mode==='auto'&&<div style={card}><div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12}}><div style={{fontSize:15,fontWeight:700,color:'#e2e8f0'}}>🌐 Auto Universe Ranked Candidates</div><div style={{color:'#8b949e',fontSize:12}}>{autoSignals.length} rows</div></div>{autoSignals.length===0&&<div style={{color:'#8b949e',fontSize:13}}>No rows yet. Press Force Scan.</div>}<div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(245px,1fr))',gap:10}}>{autoSignals.map((x,i)=><div key={x._id||i} style={{background:'#0d1117',border:`1px solid ${x.is_actionable?'#238636':'#21262d'}`,borderRadius:10,padding:12}}><div style={{display:'flex',justifyContent:'space-between',gap:8}}><div><div style={{color:'#e2e8f0',fontWeight:800,fontSize:18}}>{x.ticker}</div><div style={{color:'#8b949e',fontSize:11}}>{x.broker||'—'} · {x.execution_mode||'paper'} · {x.asset_type||'—'} · {x.timeframe||'—'}</div></div><div style={{color:sig_color(x.signal),background:sig_bg(x.signal),padding:'3px 9px',borderRadius:9,fontWeight:700,height:26}}>{x.signal}</div></div><div style={{marginTop:10}}><ConfBar value={x.confidence}/></div><div style={{color:'#8b949e',fontSize:12,marginTop:8}}>Conf {fmtPct(x.confidence)} · Score {Number.isFinite(Number(x.scanner_score))?Math.round(Number(x.scanner_score)):'—'}</div><div style={{marginTop:7,display:'inline-block',fontSize:11,color:x.is_actionable?'#3fb950':'#e3b341',background:x.is_actionable?'rgba(63,185,80,.12)':'rgba(227,179,65,.12)',padding:'3px 7px',borderRadius:8}}>{reasonLabel(x.filter_reason)}{x.diagnostic_only?' · diagnostic':''}</div><div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:6,marginTop:8}}><div style={{color:'#8b949e',fontSize:11}}>Price<br/><span style={{color:'#e2e8f0'}}>{fmtMoney(x.price)}</span></div><div style={{color:'#8b949e',fontSize:11}}>SL<br/><span style={{color:'#e2e8f0'}}>{fmtMoney(x.sl)}</span></div><div style={{color:'#8b949e',fontSize:11}}>TP<br/><span style={{color:'#e2e8f0'}}>{fmtMoney(x.tp)}</span></div></div><div style={{color:'#8b949e',fontSize:11,marginTop:8}}>{x.scanner_reason||x.error||'ranked auto universe candidate'}</div></div>)}</div></div>}{(requestLogs.length>0||loading||autoLoading)&&<div style={{...card,marginTop:14}}><div style={{display:'flex',justifyContent:'space-between',marginBottom:8}}><div style={{color:'#e2e8f0',fontWeight:700}}>🧾 Request Logs</div><div style={{color:'#8b949e',fontSize:12}}>{requestLogs.length} events</div></div><div style={{maxHeight:260,overflowY:'auto',background:'#05080d',border:'1px solid #21262d',borderRadius:10,padding:10,fontFamily:'ui-monospace, SFMono-Regular, Menlo, monospace',fontSize:12}}>{requestLogs.map((l,i)=><div key={i} style={{color:l.level==='error'?'#f85149':l.level==='success'?'#3fb950':l.level==='warning'?'#e3b341':'#8b949e',marginBottom:5}}><span style={{color:'#64748b'}}>{l.ts.slice(11,19)}</span> {l.msg}</div>)}</div></div>}{mode!=='auto'&&s&&<div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:14,marginTop:14}}><div style={card}><div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:14}}><div><div style={{fontSize:22,fontWeight:700,color:'#e2e8f0'}}>{s.ticker||ticker.toUpperCase()}</div><div style={{fontSize:12,color:'#8b949e'}}>{fmtMoney(s.price)} · {s.timeframe||tf} · {s.regime||'—'}</div></div><div style={{textAlign:'right'}}><div style={{fontSize:16,fontWeight:700,color:sig_color(s.signal),background:sig_bg(s.signal),padding:'4px 12px',borderRadius:10}}>{s.signal||'HOLD'}</div><div style={{fontSize:12,color:'#8b949e',marginTop:4}}>Confidence: {fmtPct(s.confidence)}</div></div></div><ConfBar value={s.confidence}/></div><div style={card}><div style={{fontSize:13,fontWeight:600,color:'#e2e8f0',marginBottom:12}}>📊 Indicator Breakdown</div>{(s.indicators||[]).map((ind,i)=><div key={i} style={{display:'flex',justifyContent:'space-between',padding:'5px 8px',background:'#0d1117',borderRadius:6,marginBottom:5}}><div style={{fontSize:11,color:'#8b949e'}}>{ind.indicator}</div><div style={{fontSize:11,color:sig_color(ind.signal)}}>{ind.signal}</div></div>)}</div></div>}{mode!=='auto'&&multitf&&<div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(240px,1fr))',gap:14,marginTop:14}}>{Object.entries(multitf).map(([tfName,raw])=>{const m=cleanSignal(raw);return <div key={tfName} style={card}><div style={{display:'flex',justifyContent:'space-between',marginBottom:10}}><div style={{fontSize:13,fontWeight:600,color:'#e2e8f0'}}>{tfName}</div><div style={{fontSize:12,fontWeight:600,color:sig_color(m.signal),background:sig_bg(m.signal),padding:'2px 10px',borderRadius:10}}>{m.signal}</div></div><ConfBar value={m.confidence}/><div style={{fontSize:11,color:'#8b949e',marginTop:8}}>Confidence: {fmtPct(m.confidence)} · {m.regime||m.error||'—'}</div></div>})}</div>}</div>
 }
