@@ -20,12 +20,29 @@ _TASK=None; _RUNNING=False
 BROKER_CAPABILITIES={"paper":["crypto","stock","forex"],"fusion":["stock","forex","crypto"],"alpaca":["stock","crypto"],"interactive_brokers":["stock","forex","crypto"],"ibkr":["stock","forex","crypto"],"tradestation":["stock","crypto"],"schwab":["stock"],"robinhood":["stock","crypto"],"webull":["stock","crypto"],"fidelity":["stock"],"etrade":["stock"],"binance":["crypto"],"binanceus":["crypto"],"kucoin":["crypto"],"coinbase":["crypto"],"kraken":["crypto"],"bybit":["crypto"],"okx":["crypto"],"bitget":["crypto"],"oanda":["forex"],"fxcm":["forex"],"forexcom":["forex"]}
 PAPER_ALIASES={"paper","fusion","sandbox","demo"}
 DEFAULT_TIMEFRAME_INTERVALS={"scalping":"5m","intraday":"30m","swing":"1d","position":"1wk"}
+# Profile presets — define which timeframes are scanned and in which priority order.
+# The first timeframe in each list is the "primary" focus; trailing ones are confirmations
+# that are still scanned and stored but ranked below the primary.
+PROFILE_TIMEFRAMES={
+    "scalping":["scalping","intraday"],
+    "intraday":["intraday","scalping","swing"],
+    "swing":["swing","intraday","position"],
+    "position":["position","swing"],
+    "all":["scalping","intraday","swing","position"],
+}
 def _env_bool(name,default=False):
     raw=os.getenv(name)
     if raw is None: return default
     return str(raw).strip().lower() in {"1","true","yes","on"}
 def _csv_env(name): return [x.strip() for x in os.getenv(name,"").split(",") if x.strip()]
-def _timeframes():
+async def _active_profile():
+    try:
+        doc=await db["autotrader_config"].find_one({"_id":"config"})
+        if doc and doc.get("profile"): return str(doc["profile"]).lower()
+    except Exception: pass
+    return (os.getenv("AUTO_SIGNAL_PROFILE","") or "").lower() or None
+def _timeframes(profile=None):
+    if profile and profile in PROFILE_TIMEFRAMES: return list(PROFILE_TIMEFRAMES[profile])
     vals=_csv_env("AUTO_SIGNAL_TIMEFRAMES") or _csv_env("AUTO_SIGNAL_TIMEFRAME") or ["scalping","intraday","swing"]
     out=[]
     for v in vals:
@@ -102,15 +119,15 @@ async def scan_auto_signals(broker_id="paper",asset_type=None,timeframe="swing",
     await _alog("signals",f"Finished auto scan {broker}/{execution_mode}/{asset}/{timeframe}: candidates={len(candidates)} generated={len(generated)} actionable={len(actionable)} stored={len(store)}","success" if store else "warning",run)
     run.pop("_id",None); return run
 async def scan_all_auto_signals():
-    brokers=await _configured_brokers(); timeframes=_timeframes(); scan_limit=int(os.getenv("AUTO_SIGNAL_SCAN_LIMIT","20")); signal_limit=int(os.getenv("AUTO_SIGNAL_LIMIT","10")); min_confidence=float(os.getenv("AUTO_SIGNAL_MIN_CONFIDENCE","55")); max_parallel=int(os.getenv("AUTO_SIGNAL_MAX_PARALLEL","4")); use_ai=_env_bool("AUTO_SIGNAL_USE_AI",True); discover=_env_bool("AUTO_SIGNAL_DISCOVER_UNIVERSE",True)
+    brokers=await _configured_brokers(); profile=await _active_profile(); timeframes=_timeframes(profile); scan_limit=int(os.getenv("AUTO_SIGNAL_SCAN_LIMIT","20")); signal_limit=int(os.getenv("AUTO_SIGNAL_LIMIT","10")); min_confidence=float(os.getenv("AUTO_SIGNAL_MIN_CONFIDENCE","55")); max_parallel=int(os.getenv("AUTO_SIGNAL_MAX_PARALLEL","4")); use_ai=_env_bool("AUTO_SIGNAL_USE_AI",True); discover=_env_bool("AUTO_SIGNAL_DISCOVER_UNIVERSE",True)
     jobs=[(b,_execution_mode_for_broker(b),a,tf,_interval_for_timeframe(tf)) for b in brokers for a in _asset_types_for_broker(b) for tf in timeframes]; sem=asyncio.Semaphore(max(1,max_parallel))
-    await _alog("signals",f"Full scan plan: {len(jobs)} broker/mode/asset/timeframe runs",data={"timeframes":timeframes,"jobs":[{"broker":b,"mode":m,"asset_type":a,"timeframe":tf,"interval":iv} for b,m,a,tf,iv in jobs]})
+    await _alog("signals",f"Full scan plan: profile={profile or 'env'} {len(jobs)} broker/mode/asset/timeframe runs",data={"profile":profile,"timeframes":timeframes,"jobs":[{"broker":b,"mode":m,"asset_type":a,"timeframe":tf,"interval":iv} for b,m,a,tf,iv in jobs]})
     async def _one(broker,mode,asset,tf,iv):
         async with sem:
             try: return await scan_auto_signals(broker,asset,tf,iv,scan_limit,signal_limit,min_confidence,use_ai,discover,mode)
             except Exception as e:
                 await _alog("signals",f"auto signal scan failed for {broker}/{mode}/{asset}/{tf}: {e}","error"); log.warning(f"auto signal scan failed for {broker}/{mode}/{asset}/{tf}: {e}"); return {"broker":broker,"execution_mode":mode,"asset_type":asset,"timeframe":tf,"interval":iv,"error":str(e),"finished_at":datetime.utcnow().isoformat()}
-    runs=await asyncio.gather(*(_one(b,m,a,tf,iv) for b,m,a,tf,iv in jobs)); return {"brokers":brokers,"timeframes":timeframes,"runs":list(runs),"finished_at":datetime.utcnow().isoformat()}
+    runs=await asyncio.gather(*(_one(b,m,a,tf,iv) for b,m,a,tf,iv in jobs)); return {"brokers":brokers,"profile":profile,"timeframes":timeframes,"runs":list(runs),"finished_at":datetime.utcnow().isoformat()}
 async def latest_auto_signals(broker_id=None,asset_type=None,limit=50,execution_mode=None,timeframe=None):
     q={}
     if broker_id: q["broker"]=normalize_broker_id(broker_id)

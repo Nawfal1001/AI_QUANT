@@ -5,11 +5,13 @@ from fastapi import APIRouter, Depends, HTTPException
 from middleware.auth import get_current_user, scope_filter
 from services.backtest_engine import fetch_history, run_backtest, run_compare
 from services.optuna_optimizer import optimize_backtest
+from services.universal_backtest import run_universal_backtest, optimize_universal
+from services.universal_strategy import UNIVERSAL_PARAM_SPACE, DEFAULT_PARAMS as UNIVERSAL_DEFAULTS
 from services.strategies import list_strategies
 from services.logger import child
 from database import db
 log=child("backtest_router"); router=APIRouter(); col=db["backtests"]; jobs=db["backtest_jobs"]
-VALID_INTERVALS={"1d","4h","1h","15m"}; MAX_BACKTEST_DAYS=3650
+VALID_INTERVALS={"1d","4h","1h","30m","15m","5m","1m","1wk"}; MAX_BACKTEST_DAYS=3650
 def _now(): return datetime.utcnow().isoformat()
 def _adaptive(req):
     mode=req.get("strategy_mode") or ("adaptive_regime" if req.get("adaptive_regime") else "static")
@@ -114,4 +116,42 @@ async def history(limit:int=20,user=Depends(get_current_user)):
 async def clear_history(user=Depends(get_current_user)):
     res=await col.delete_many(scope_filter(user)); return {"deleted":res.deleted_count}
 @router.get("/timeframes")
-async def tfs(): return {"intervals":["1d","4h","1h","15m"],"presets":[{"label":"Last 90 days","days":90},{"label":"Last 6 months","days":180},{"label":"Last 1 year","days":365},{"label":"Last 2 years","days":730}]}
+async def tfs(): return {"intervals":sorted(VALID_INTERVALS),"presets":[{"label":"Last 90 days","days":90},{"label":"Last 6 months","days":180},{"label":"Last 1 year","days":365},{"label":"Last 2 years","days":730}]}
+
+@router.get("/universal/spec")
+async def universal_spec():
+    return {"param_space": UNIVERSAL_PARAM_SPACE, "defaults": UNIVERSAL_DEFAULTS}
+
+def _validate_universal(req:dict):
+    days=int(req.get("days",365))
+    if days<=0 or days>MAX_BACKTEST_DAYS: raise HTTPException(400,f"days must be 1..{MAX_BACKTEST_DAYS}")
+    syms=req.get("symbols") or req.get("tickers")
+    if syms and not isinstance(syms,(list,str)): raise HTTPException(400,"symbols must be a list or comma string")
+    if isinstance(syms,list) and len(syms)>30: raise HTTPException(400,"symbols max 30")
+    ivs=req.get("intervals") or req.get("timeframes") or [req.get("interval","1d")]
+    if isinstance(ivs,str): ivs=[x.strip() for x in ivs.split(",") if x.strip()]
+    bad=[i for i in ivs if i not in VALID_INTERVALS]
+    if bad: raise HTTPException(400,f"interval(s) {bad} not in {sorted(VALID_INTERVALS)}")
+    trials=int(req.get("optuna_trials",req.get("trials",25)))
+    if trials<5 or trials>300: raise HTTPException(400,"optuna_trials must be 5..300")
+
+@router.post("/universal/run")
+async def universal_run(req:dict,user=Depends(get_current_user)):
+    _validate_universal(req); return await run_universal_backtest(req)
+
+@router.post("/universal/optimize")
+async def universal_optimize(req:dict,user=Depends(get_current_user)):
+    _validate_universal(req); job_id=str(uuid.uuid4())
+    await jobs.insert_one({"job_id":job_id,"user_id":user["id"],"status":"queued","progress":0,"logs":[{"ts":_now(),"level":"info","message":"Queued universal Optuna job.","data":{}}],"request":req,"created_at":_now(),"updated_at":_now()})
+    async def _run():
+        try:
+            await _set_progress(job_id,"running",5)
+            async def lf(msg,level="info",data=None): await _job_log(job_id,msg,level,data)
+            async def pf(p): await _set_progress(job_id,"running",p)
+            opt=await optimize_universal(req,user,log_fn=lf,progress_fn=pf)
+            await _set_progress(job_id,"completed",100,result=opt)
+            await _job_log(job_id,"Universal Optuna optimisation completed.","success")
+        except Exception as e:
+            log.exception(f"universal optuna failed: {e}"); await _job_log(job_id,f"Failed: {e}","error"); await _set_progress(job_id,"failed",100,error=str(e))
+    asyncio.create_task(_run())
+    return {"job_id":job_id,"status":"queued","progress":0}

@@ -153,12 +153,15 @@ def _detect_backtest_regime(window):
 def _pick_adaptive_strategy(regime, fallback="ensemble", regime_strategy_map=None):
     mp={**REGIME_STRATEGY_MAP, **(regime_strategy_map or {})}; picked=mp.get(regime) or fallback
     return picked if picked in STRATEGIES else (fallback if fallback in STRATEGIES else "ensemble")
-async def run_backtest(ticker: str, asset_type: str = "stock", start_date: str = None, end_date: str = None, interval: str = "1d", initial_capital: float = 10000, risk_per_trade: float = 0.02, min_confidence: int = 55, sl_atr_mult: float = 2.0, tp_atr_mult: float = 3.0, fee_bps: float = DEFAULT_FEE_BPS, slippage_bps: float = DEFAULT_SLIPPAGE_BPS, spread_bps: float = DEFAULT_SPREAD_BPS, max_hold_bars: int = 30, strategy: str = "ensemble", custom_strategy_def: dict = None, strategy_mode: str = "static", adaptive_regime: bool = False, regime_strategy_map: dict = None):
+async def run_backtest(ticker: str, asset_type: str = "stock", start_date: str = None, end_date: str = None, interval: str = "1d", initial_capital: float = 10000, risk_per_trade: float = 0.02, min_confidence: int = 55, sl_atr_mult: float = 2.0, tp_atr_mult: float = 3.0, fee_bps: float = DEFAULT_FEE_BPS, slippage_bps: float = DEFAULT_SLIPPAGE_BPS, spread_bps: float = DEFAULT_SPREAD_BPS, max_hold_bars: int = 30, strategy: str = "ensemble", custom_strategy_def: dict = None, strategy_mode: str = "static", adaptive_regime: bool = False, regime_strategy_map: dict = None, strategy_params: dict = None):
     adaptive_regime = adaptive_regime or strategy_mode in {"adaptive","adaptive_regime","regime"}
     if custom_strategy_def is not None and not adaptive_regime:
         from services.custom_strategy import run_custom_strategy
         strategy_name=custom_strategy_def.get("name","custom")
         def static_signal_fn(window): return run_custom_strategy(custom_strategy_def,window)
+    elif strategy == "universal" and strategy_params and not adaptive_regime:
+        from services.universal_strategy import make_universal_fn
+        static_signal_fn=make_universal_fn(strategy_params); strategy_name="universal"
     else:
         if strategy not in STRATEGIES: return {"error":f"Unknown strategy: {strategy}. Available: {list(STRATEGIES.keys())}"}
         static_signal_fn=STRATEGIES[strategy]; strategy_name=strategy

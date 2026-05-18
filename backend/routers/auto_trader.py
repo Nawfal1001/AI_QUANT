@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from middleware.auth import get_current_user, require_admin, scope_filter
 from services.auto_trader import (
     get_config, update_config, scan_and_execute, monitor_open,
-    start_scheduler, stop_scheduler,
+    start_scheduler, stop_scheduler, PROFILE_PRESETS,
 )
 from services import risk_engine
 from services import ttl_cache
@@ -24,7 +24,10 @@ async def _audit(event, level='info', data=None):
 
 @router.get("/config")
 async def config(user=Depends(get_current_user)):
-    return await get_config()
+    cfg = await get_config()
+    cfg["_profile_options"] = sorted(PROFILE_PRESETS.keys())
+    cfg["_profile_presets"] = PROFILE_PRESETS
+    return cfg
 
 async def _open_trades_live_payload(user):
     q = scope_filter(user, {"status": "open"})
@@ -61,6 +64,13 @@ async def dashboard(user=Depends(get_current_user)):
 async def upd(d: dict, user=Depends(require_admin)):
     try:
         await _audit("config_update_requested", data={"user":user.get("email") or user.get("id"),"patch":d})
+        if "profile" in d and str(d["profile"]).lower() not in PROFILE_PRESETS:
+            raise HTTPException(400, f"profile must be one of {list(PROFILE_PRESETS.keys())}")
+        if "leverage" in d:
+            try: lev=float(d["leverage"])
+            except Exception: raise HTTPException(400, "leverage must be numeric")
+            if not 1.0 <= lev <= 125.0:
+                raise HTTPException(400, "leverage must be in [1, 125]")
         if d.get("enabled") is True:
             if not await risk_engine.is_configured(user["id"]):
                 await _audit("config_update_blocked", "warning", {"reason":"Risk limits not configured"})

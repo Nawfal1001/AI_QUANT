@@ -16,7 +16,19 @@ try:
 except Exception:
     log_event = None
 cfg_col=db["autotrader_config"]; trades_col=db["open_trades"]; hist_col=db["trade_history"]; rl_ep_col=db["rl_episodes"]
-DEFAULT={"enabled":False,"paper_mode":True,"min_confidence":70,"max_open":5,"risk_per_trade":2.0,"capital":10000,"timeframe":"swing","scan_interval":300,"signal_source":"hybrid","auto_signal_limit":25,"allow_diagnostic_auto_signals":True,"use_quant":True,"use_stops":True,"use_mtf":True,"use_portfolio_risk":True,"use_rl_agent":True,"use_meta_learner":True,"use_defensive":True,"watchlist":[{"ticker":"AAPL","type":"stock"},{"ticker":"NVDA","type":"stock"},{"ticker":"TSLA","type":"stock"},{"ticker":"BTC","type":"crypto"},{"ticker":"ETH","type":"crypto"},{"ticker":"SOL","type":"crypto"}]}
+# Profile presets — applied (without overwriting user-set values) when profile is selected.
+# Each preset tunes timeframe, max_hold_bars, scan cadence, min_confidence, and risk_per_trade.
+PROFILE_PRESETS={
+    "scalping":{"timeframe":"scalping","scan_interval":120,"min_confidence":72,"risk_per_trade":1.0,"max_hold_bars":12,"sl_atr_mult":1.2,"tp_atr_mult":1.8},
+    "intraday":{"timeframe":"intraday","scan_interval":300,"min_confidence":68,"risk_per_trade":1.5,"max_hold_bars":30,"sl_atr_mult":1.8,"tp_atr_mult":2.6},
+    "swing":{"timeframe":"swing","scan_interval":900,"min_confidence":65,"risk_per_trade":2.0,"max_hold_bars":60,"sl_atr_mult":2.5,"tp_atr_mult":4.0},
+    "position":{"timeframe":"position","scan_interval":3600,"min_confidence":62,"risk_per_trade":2.5,"max_hold_bars":150,"sl_atr_mult":3.5,"tp_atr_mult":6.0},
+}
+DEFAULT={"enabled":False,"paper_mode":True,"profile":"swing","leverage":1.0,"min_confidence":70,"max_open":5,"risk_per_trade":2.0,"capital":10000,"timeframe":"swing","scan_interval":300,"signal_source":"hybrid","auto_signal_limit":25,"allow_diagnostic_auto_signals":True,"use_quant":True,"use_stops":True,"use_mtf":True,"use_portfolio_risk":True,"use_rl_agent":True,"use_meta_learner":True,"use_defensive":True,"watchlist":[{"ticker":"AAPL","type":"stock"},{"ticker":"NVDA","type":"stock"},{"ticker":"TSLA","type":"stock"},{"ticker":"BTC","type":"crypto"},{"ticker":"ETH","type":"crypto"},{"ticker":"SOL","type":"crypto"}]}
+def _clamp_leverage(v,lo=1.0,hi=125.0):
+    try: x=float(v)
+    except Exception: return 1.0
+    return max(lo,min(hi,x))
 async def _alog(message,level="info",data=None):
     if log_event:
         try: await log_event("autotrader",message,level=level,data=data or {})
@@ -26,6 +38,15 @@ async def get_config():
     if not doc: await cfg_col.insert_one({"_id":"config",**DEFAULT}); return DEFAULT.copy()
     doc.pop("_id",None); return {**DEFAULT,**doc}
 async def update_config(updates):
+    if "profile" in updates:
+        prof=str(updates["profile"]).lower()
+        if prof in PROFILE_PRESETS:
+            updates["profile"]=prof
+            # Apply preset only for keys the user has not explicitly overridden in this patch.
+            for k,v in PROFILE_PRESETS[prof].items():
+                updates.setdefault(k,v)
+    if "leverage" in updates:
+        updates["leverage"]=_clamp_leverage(updates["leverage"])
     await cfg_col.update_one({"_id":"config"},{"$set":updates},upsert=True); cfg=await get_config(); return {"status":"updated","config":cfg}
 async def _latest_auto_signal_items(config,min_c):
     source=config.get("signal_source",os.getenv("AUTOTRADER_SIGNAL_SOURCE","hybrid"))
@@ -35,7 +56,18 @@ async def _latest_auto_signal_items(config,min_c):
     q={"confidence":{"$gte":float(min_c)},"signal":{"$regex":"BUY|SELL","$options":"i"}}
     if not allow_diag:
         q.update({"is_actionable":True,"diagnostic_only":{"$ne":True}})
-    docs=await db["auto_signals"].find(q).sort([("is_actionable",-1),("confidence",-1),("scanner_score",-1),("created_at",-1)]).limit(limit).to_list(limit)
+    # Profile-aware ordering: signals matching the profile's primary timeframe come first.
+    profile=(config.get("profile") or "").lower()
+    try:
+        from services.auto_signal_scanner import PROFILE_TIMEFRAMES
+        preferred_tfs=PROFILE_TIMEFRAMES.get(profile,[])
+    except Exception:
+        preferred_tfs=[]
+    docs=await db["auto_signals"].find(q).sort([("is_actionable",-1),("confidence",-1),("scanner_score",-1),("created_at",-1)]).limit(limit*3 if preferred_tfs else limit).to_list(limit*3 if preferred_tfs else limit)
+    if preferred_tfs:
+        rank={tf:i for i,tf in enumerate(preferred_tfs)}
+        docs.sort(key=lambda d:(rank.get(str(d.get("timeframe","")).lower(),99),-(float(d.get("confidence",0) or 0))))
+        docs=docs[:limit]
     items=[]
     for d in docs:
         ticker=d.get("ticker"); atype=d.get("asset_type","stock")
@@ -106,15 +138,17 @@ async def scan_and_execute():
             try: pos_pct=(await optimal_position(ticker,atype,sig["signal"],capital,wr,aw,al,regime,trade_ret,eq))["recommended_pct"]
             except Exception: pos_pct=config.get("risk_per_trade",2.0)
         else: pos_pct=config.get("risk_per_trade",2.0)
+        leverage=_clamp_leverage(config.get("leverage",1.0))
         pos_pct=pos_pct*rl_size_mult*size_mult
         final_sig=sig["signal"]; final_conf=conf
         entry=float(sig.get("price") or sig.get("entry_price") or 0)
         if entry<=0: skipped.append({"ticker":ticker,"reason":"missing_price"}); continue
-        qty=capital*(pos_pct/100)/entry; atr_val=float(sig.get("atr") or entry*0.02)
+        # Leverage multiplies notional exposure for a given margin (position_pct of capital).
+        qty=capital*(pos_pct/100)*leverage/entry; atr_val=float(sig.get("atr") or entry*0.02)
         if config.get("use_stops",True) and item.get("source")!="auto_signals": sl=optimal_trailing_stop(entry,entry,atr_val,0,200,"long" if "BUY" in final_sig else "short")["optimal_stop"]
         else: sl=float(sig.get("sl") or entry*(0.97 if "BUY" in final_sig else 1.03))
         tp=float(sig.get("tp") or entry*(1.06 if "BUY" in final_sig else 0.94))
-        trade={"ticker":ticker,"asset_type":atype,"signal":final_sig,"confidence":final_conf,"entry_price":entry,"quantity":round(qty,6),"position_value":round(capital*pos_pct/100,2),"position_pct":round(pos_pct,2),"sl":round(sl,4),"tp":round(tp,4),"atr":round(atr_val,4),"regime":regime,"timeframe":sig.get("timeframe",tf),"status":"open","paper_mode":config.get("paper_mode",True),"opened_at":datetime.utcnow().isoformat(),"source":item.get("source"),"auto_signal_id":str(sig.get("_id","")),"diagnostic_source":bool(sig.get("diagnostic_only")),"scanner_score":sig.get("scanner_score"),"quant_powered":config.get("use_quant",True),"rl_state":rl_state_key,"rl_action":rl_action_idx,"rl_size_mult":rl_size_mult,"meta_p_win":meta.get("p_win",None),"indicators_at_entry":sig.get("indicators",[]),"enhancements_at_entry":sig.get("enhancements",{}),"entropy_tradeable":next((i.get("tradeable",True) for i in sig.get("indicators",[]) if i.get("indicator")=="ENTROPY"),True)}
+        trade={"ticker":ticker,"asset_type":atype,"signal":final_sig,"confidence":final_conf,"entry_price":entry,"quantity":round(qty,6),"position_value":round(capital*pos_pct/100*leverage,2),"margin_used":round(capital*pos_pct/100,2),"leverage":leverage,"profile":config.get("profile"),"position_pct":round(pos_pct,2),"sl":round(sl,4),"tp":round(tp,4),"atr":round(atr_val,4),"regime":regime,"timeframe":sig.get("timeframe",tf),"status":"open","paper_mode":config.get("paper_mode",True),"opened_at":datetime.utcnow().isoformat(),"source":item.get("source"),"auto_signal_id":str(sig.get("_id","")),"diagnostic_source":bool(sig.get("diagnostic_only")),"scanner_score":sig.get("scanner_score"),"quant_powered":config.get("use_quant",True),"rl_state":rl_state_key,"rl_action":rl_action_idx,"rl_size_mult":rl_size_mult,"meta_p_win":meta.get("p_win",None),"indicators_at_entry":sig.get("indicators",[]),"enhancements_at_entry":sig.get("enhancements",{}),"entropy_tradeable":next((i.get("tradeable",True) for i in sig.get("indicators",[]) if i.get("indicator")=="ENTROPY"),True)}
         await trades_col.insert_one(trade); executed.append({"ticker":ticker,"signal":final_sig,"entry":entry,"size":round(pos_pct,2),"source":item.get("source"),"confidence":final_conf}); open_cnt+=1
         await _alog(f"Opened paper trade from {item.get('source')}: {final_sig} {ticker} conf={final_conf} entry={entry}","success",executed[-1])
     return {"status":"scanned","source":config.get("signal_source","hybrid"),"candidates":len(items),"executed":len(executed),"trades":executed,"skipped":skipped[:50],"rl_decisions":rl_decisions,"defensive_mode":defensive_adj}

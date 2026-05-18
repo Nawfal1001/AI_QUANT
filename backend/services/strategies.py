@@ -319,6 +319,11 @@ def gap_fade(window):
     return {"signal": "HOLD", "confidence": 40, "atr_pct": atr_pct, "strategy": "gap_fade"}
 
 
+def _universal_default(window):
+    from services.universal_strategy import universal
+    return universal(window)
+
+
 STRATEGIES = {
     "trend_follow": trend_follow,
     "mean_revert": mean_revert,
@@ -327,6 +332,7 @@ STRATEGIES = {
     "momentum_pullback": momentum_pullback,
     "volatility_breakout": volatility_breakout,
     "gap_fade": gap_fade,
+    "universal": _universal_default,
 }
 
 
@@ -339,4 +345,5 @@ def list_strategies():
         {"id": "momentum_pullback", "name": "Momentum Pullback", "desc": "Buys pullbacks to EMA20 inside an established uptrend", "builtin": True},
         {"id": "volatility_breakout", "name": "Volatility Breakout", "desc": "ATR-expansion + volume + directional close", "builtin": True},
         {"id": "gap_fade", "name": "Gap Fade", "desc": "Fades opening gaps that lose follow-through", "builtin": True},
+        {"id": "universal", "name": "Universal Multi-Factor", "desc": "Parameter-driven mix of trend, momentum, breakout & mean-reversion. Optimised by Optuna across symbols/timeframes.", "builtin": True, "optunable": True},
     ]
