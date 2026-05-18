@@ -12,7 +12,7 @@ import Portfolio from '@/pages/Portfolio'
 import Signals from '@/pages/Signals'
 import StrategyDashboard from '@/pages/StrategyDashboard'
 import QuantDashboard from '@/pages/QuantDashboard'
-import AutoTrader from '@/pages/AutoTrader'
+import AutoTraderLive from '@/pages/AutoTraderLive'
 import TradeInspector from '@/pages/TradeInspector'
 import Learning from '@/pages/Learning'
 import Backtest from '@/pages/Backtest'
@@ -55,7 +55,7 @@ export default function App() {
             <Route path="signals"    element={<Signals />} />
             <Route path="strategy"   element={<StrategyDashboard />} />
             <Route path="quant"      element={<QuantDashboard />} />
-            <Route path="autotrader" element={<AutoTrader />} />
+            <Route path="autotrader" element={<AutoTraderLive />} />
             <Route path="trade/:source/:tradeId" element={<TradeInspector />} />
             <Route path="learning"   element={<Learning />} />
             <Route path="backtest"   element={<Backtest />} />
