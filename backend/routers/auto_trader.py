@@ -7,6 +7,7 @@ from services.auto_trader import (
     start_scheduler, stop_scheduler,
 )
 from services import risk_engine
+from services import ttl_cache
 from database import db
 
 router = APIRouter()
@@ -62,18 +63,21 @@ def _enrich_trade(t, live_price, price_age_sec=None, price_ts=None, price_source
 async def config(user=Depends(get_current_user)):
     return await get_config()
 
-@router.get("/open-trades/live")
-async def open_trades_live(user=Depends(get_current_user)):
+async def _open_trades_live_payload(user):
     q = scope_filter(user, {"status": "open"})
     trades = await db["open_trades"].find(q).sort("opened_at", -1).to_list(100)
     enriched=[]
     for t in trades:
         price, age, ts, src = await _live_price(t.get('ticker'), t.get('asset_type','stock'))
         enriched.append(_enrich_trade(t, price, age, ts, src))
-    return {"trades": enriched, "count": len(enriched), "updated_at": datetime.utcnow().isoformat()}
+    return {"trades": enriched, "count": len(enriched), "updated_at": datetime.utcnow().isoformat(), "cache_ttl_sec": 5}
 
-@router.get("/dashboard")
-async def dashboard(user=Depends(get_current_user)):
+@router.get("/open-trades/live")
+async def open_trades_live(user=Depends(get_current_user)):
+    key=ttl_cache.make_key('autotrader_live', user.get('id') or user.get('email'))
+    return await ttl_cache.cached(key, 5, lambda: _open_trades_live_payload(user))
+
+async def _dashboard_payload(user):
     cfg = await get_config()
     stats_q = scope_filter(user)
     open_q = scope_filter(user, {"status": "open"})
@@ -87,9 +91,14 @@ async def dashboard(user=Depends(get_current_user)):
         live_open.append(_enrich_trade(t, price, age, ts, src))
     last_hist = await db["trade_history"].find(stats_q).sort("closed_at", -1).limit(10).to_list(10)
     suggestions = await db["bot_strategy_suggestions"].find(scope_filter(user)).sort("created_at", -1).limit(10).to_list(10)
-    recent_signals = await db["auto_signals"].find({"signal": {"$regex": "BUY|SELL", "$options": "i"}}).sort("created_at", -1).limit(15).to_list(15)
+    recent_signals = await db["auto_signals"].find({}).sort("created_at", -1).limit(15).to_list(15)
     now = datetime.utcnow(); interval = int(cfg.get("scan_interval", 300) or 300)
-    return {"config": cfg,"schedule": {"enabled": bool(cfg.get("enabled")),"scan_interval_sec": interval,"scan_interval_min": round(interval / 60, 2),"next_scan_estimate": (now + timedelta(seconds=interval)).isoformat(),"signal_source": cfg.get("signal_source", "hybrid"),"auto_signal_limit": cfg.get("auto_signal_limit", 25),"allow_diagnostic_auto_signals": bool(cfg.get("allow_diagnostic_auto_signals", True)),"paper_mode": bool(cfg.get("paper_mode", True))},"stats": {"total_trades": total, "wins": wins, "losses": total - wins, "win_rate": round(wins / max(total, 1) * 100, 1), "open_positions": open_cnt},"open_trades": live_open,"recent_history": [_oid(x) for x in last_hist],"suggestions": [_oid(x) for x in suggestions],"recent_auto_signals": [_oid(x) for x in recent_signals]}
+    return {"config": cfg,"schedule": {"enabled": bool(cfg.get("enabled")),"scan_interval_sec": interval,"scan_interval_min": round(interval / 60, 2),"next_scan_estimate": (now + timedelta(seconds=interval)).isoformat(),"signal_source": cfg.get("signal_source", "hybrid"),"auto_signal_limit": cfg.get("auto_signal_limit", 25),"allow_diagnostic_auto_signals": bool(cfg.get("allow_diagnostic_auto_signals", True)),"paper_mode": bool(cfg.get("paper_mode", True))},"stats": {"total_trades": total, "wins": wins, "losses": total - wins, "win_rate": round(wins / max(total, 1) * 100, 1), "open_positions": open_cnt},"open_trades": live_open,"recent_history": [_oid(x) for x in last_hist],"suggestions": [_oid(x) for x in suggestions],"recent_auto_signals": [_oid(x) for x in recent_signals],"cache_ttl_sec":5}
+
+@router.get("/dashboard")
+async def dashboard(user=Depends(get_current_user)):
+    key=ttl_cache.make_key('autotrader_dashboard', user.get('id') or user.get('email'))
+    return await ttl_cache.cached(key, 5, lambda: _dashboard_payload(user))
 
 @router.patch("/config")
 async def upd(d: dict, user=Depends(require_admin)):
@@ -100,6 +109,7 @@ async def upd(d: dict, user=Depends(require_admin)):
                 await _audit("config_update_blocked", "warning", {"reason":"Risk limits not configured"})
                 raise HTTPException(400, "Risk limits not configured. Set them in Settings first.")
         res=await update_config(d)
+        ttl_cache.clear('autotrader_dashboard'); ttl_cache.clear('autotrader_live')
         await _audit("config_update_saved", "success", {"config":res})
         return res
     except HTTPException:
@@ -110,11 +120,13 @@ async def upd(d: dict, user=Depends(require_admin)):
 
 @router.post("/start")
 async def start(user=Depends(require_admin)):
+    ttl_cache.clear('autotrader_dashboard')
     await _audit("scheduler_start_requested", data={"user":user.get("email") or user.get("id")})
     return await start_scheduler()
 
 @router.post("/stop")
 async def stop(user=Depends(require_admin)):
+    ttl_cache.clear('autotrader_dashboard')
     await _audit("scheduler_stop_requested", data={"user":user.get("email") or user.get("id")})
     return await stop_scheduler()
 
@@ -123,6 +135,7 @@ async def scan(user=Depends(require_admin)):
     await _audit("manual_scan_started", data={"user":user.get("email") or user.get("id")})
     try:
         res=await scan_and_execute()
+        ttl_cache.clear('autotrader_dashboard'); ttl_cache.clear('autotrader_live'); ttl_cache.clear('trade_history')
         await _audit("manual_scan_finished", "success", res)
         return res
     except Exception as e:
@@ -134,6 +147,7 @@ async def monitor(user=Depends(require_admin)):
     await _audit("monitor_started", data={"user":user.get("email") or user.get("id")})
     try:
         res=await monitor_open()
+        ttl_cache.clear('autotrader_dashboard'); ttl_cache.clear('autotrader_live'); ttl_cache.clear('trade_history')
         await _audit("monitor_finished", "success", res)
         return res
     except Exception as e:
@@ -154,10 +168,13 @@ async def open_trades(user=Depends(get_current_user)):
 
 @router.get("/trade-history")
 async def history(limit: int = Query(50, ge=1, le=500), user=Depends(get_current_user)):
-    q = scope_filter(user)
-    trades = await db["trade_history"].find(q).sort("closed_at", -1).limit(limit).to_list(limit)
-    for t in trades: t["_id"] = str(t["_id"])
-    return {"history": trades}
+    key=ttl_cache.make_key('trade_history', user.get('id') or user.get('email'), limit)
+    async def build():
+        q = scope_filter(user)
+        trades = await db["trade_history"].find(q).sort("closed_at", -1).limit(limit).to_list(limit)
+        for t in trades: t["_id"] = str(t["_id"])
+        return {"history": trades, "cache_ttl_sec": 10}
+    return await ttl_cache.cached(key, 10, build)
 
 @router.get("/suggestions")
 async def suggestions(limit: int = Query(50, ge=1, le=200), user=Depends(get_current_user)):
@@ -177,6 +194,7 @@ async def apply_suggestion(suggestion_id: str, user=Depends(require_admin)):
     if bot_cfg.get("schedule"): updates["timeframe"] = bot_cfg.get("schedule")
     updates["signal_source"] = "auto_signals"; updates["allow_diagnostic_auto_signals"] = True
     await update_config(updates)
+    ttl_cache.clear('autotrader_dashboard')
     await db["bot_strategy_suggestions"].update_one({"_id": oid}, {"$set": {"status": "applied", "applied_at": datetime.utcnow().isoformat(), "applied_updates": updates}})
     await _audit("suggestion_applied", "success", {"suggestion_id":suggestion_id,"updates":updates})
     return {"status": "applied", "updates": updates, "suggestion": _oid(sug)}
