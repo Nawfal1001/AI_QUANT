@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from middleware.auth import get_current_user
 from services import user_strategies
 from services.custom_strategy import REFERENCE, validate_strategy, validate_expression
+from services.advanced_strategy_templates import BAYESIAN_VOTING_TEMPLATES
 
 router = APIRouter()
 
@@ -14,6 +15,11 @@ router = APIRouter()
 async def reference(user=Depends(get_current_user)):
     """Returns the list of variables, functions, and example rules users can use."""
     return REFERENCE
+
+
+@router.get("/templates")
+async def templates(user=Depends(get_current_user)):
+    return {"templates": BAYESIAN_VOTING_TEMPLATES}
 
 
 @router.get("/")
