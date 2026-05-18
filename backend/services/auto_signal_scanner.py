@@ -1,6 +1,7 @@
 """
 Automatic Universe Signal Scanner with diagnostic output.
 Auto-infers broker asset coverage without requiring AUTO_SIGNAL_ASSET_TYPES_* env vars.
+Supports multi-timeframe scans: scalping, intraday, swing.
 """
 from __future__ import annotations
 import asyncio, os
@@ -18,11 +19,25 @@ log=child("auto_signal_scanner"); col_auto_signals=db["auto_signals"]; col_auto_
 _TASK=None; _RUNNING=False
 BROKER_CAPABILITIES={"paper":["crypto","stock","forex"],"fusion":["stock","forex","crypto"],"alpaca":["stock","crypto"],"interactive_brokers":["stock","forex","crypto"],"ibkr":["stock","forex","crypto"],"tradestation":["stock","crypto"],"schwab":["stock"],"robinhood":["stock","crypto"],"webull":["stock","crypto"],"fidelity":["stock"],"etrade":["stock"],"binance":["crypto"],"binanceus":["crypto"],"kucoin":["crypto"],"coinbase":["crypto"],"kraken":["crypto"],"bybit":["crypto"],"okx":["crypto"],"bitget":["crypto"],"oanda":["forex"],"fxcm":["forex"],"forexcom":["forex"]}
 PAPER_ALIASES={"paper","fusion","sandbox","demo"}
+DEFAULT_TIMEFRAME_INTERVALS={"scalping":"5m","intraday":"30m","swing":"1d","position":"1wk"}
 def _env_bool(name,default=False):
     raw=os.getenv(name)
     if raw is None: return default
     return str(raw).strip().lower() in {"1","true","yes","on"}
 def _csv_env(name): return [x.strip() for x in os.getenv(name,"").split(",") if x.strip()]
+def _timeframes():
+    vals=_csv_env("AUTO_SIGNAL_TIMEFRAMES") or _csv_env("AUTO_SIGNAL_TIMEFRAME") or ["scalping","intraday","swing"]
+    out=[]
+    for v in vals:
+        v=v.lower().strip()
+        if v and v not in out: out.append(v)
+    return out or ["swing"]
+def _interval_for_timeframe(tf):
+    env=os.getenv(f"AUTO_SIGNAL_INTERVAL_{tf.upper()}")
+    if env: return env.strip()
+    if os.getenv("AUTO_SIGNAL_TIMEFRAMES") is None and os.getenv("AUTO_SIGNAL_TIMEFRAME") and os.getenv("AUTO_SIGNAL_INTERVAL"):
+        return os.getenv("AUTO_SIGNAL_INTERVAL","1d")
+    return DEFAULT_TIMEFRAME_INTERVALS.get(tf,"1d")
 async def _alog(scope,message,level="info",data=None):
     if log_event:
         try: await log_event(scope,message,level=level,data=data or {})
@@ -66,41 +81,42 @@ async def scan_auto_signals(broker_id="paper",asset_type=None,timeframe="swing",
     await _alog("signals",f"Starting auto scan {broker}/{execution_mode}/{asset} interval={interval} timeframe={timeframe} min_conf={min_confidence}")
     scan=await scan_universe(asset_type=asset,interval=interval,limit=scan_limit,use_ai=use_ai,discover=discover,broker_id=broker)
     candidates=scan.get("selected",[])[:scan_limit]
-    await _alog("signals",f"Universe scan {broker}/{execution_mode}/{asset}: {len(candidates)} candidates selected",data={"broker":broker,"mode":execution_mode,"asset_type":asset,"candidate_count":len(candidates)})
+    await _alog("signals",f"Universe scan {broker}/{execution_mode}/{asset}/{timeframe}: {len(candidates)} candidates selected",data={"broker":broker,"mode":execution_mode,"asset_type":asset,"timeframe":timeframe,"interval":interval,"candidate_count":len(candidates)})
     generated=[]
     for candidate in candidates:
         ticker=candidate.get("ticker")
         if not ticker: continue
         try:
             sig=await generate_signal(ticker,asset,timeframe,use_ai=use_ai)
-            sig.update({"broker":broker,"execution_mode":execution_mode,"scanner_score":candidate.get("score"),"scanner_reason":candidate.get("reason"),"auto_signal":True,"created_at":datetime.utcnow().isoformat(),"direction":_signal_direction(sig.get("signal"))})
+            sig.update({"broker":broker,"execution_mode":execution_mode,"scanner_score":candidate.get("score"),"scanner_reason":candidate.get("reason"),"auto_signal":True,"created_at":datetime.utcnow().isoformat(),"direction":_signal_direction(sig.get("signal")),"strategy_mode":timeframe,"timeframe":timeframe,"interval":interval})
         except Exception as e:
-            sig={"ticker":ticker,"asset_type":asset,"broker":broker,"execution_mode":execution_mode,"signal":"HOLD","confidence":0,"error":str(e),"created_at":datetime.utcnow().isoformat(),"direction":"HOLD","scanner_score":candidate.get("score"),"scanner_reason":candidate.get("reason")}
+            sig={"ticker":ticker,"asset_type":asset,"broker":broker,"execution_mode":execution_mode,"signal":"HOLD","confidence":0,"error":str(e),"created_at":datetime.utcnow().isoformat(),"direction":"HOLD","scanner_score":candidate.get("score"),"scanner_reason":candidate.get("reason"),"strategy_mode":timeframe,"timeframe":timeframe,"interval":interval}
         sig["is_actionable"]=sig.get("direction") in {"BUY","SELL"} and float(sig.get("confidence",0) or 0)>=float(min_confidence); sig["filter_reason"]=_filter_reason(sig,min_confidence); generated.append(sig)
-        await _alog("signals",f"{broker}/{execution_mode}/{asset} {ticker}: {sig.get('signal')} conf={sig.get('confidence')} reason={sig.get('filter_reason')}","success" if sig["is_actionable"] else "info",{"ticker":ticker,"broker":broker,"mode":execution_mode,"asset_type":asset,"signal":sig.get("signal"),"confidence":sig.get("confidence"),"reason":sig.get("filter_reason")})
+        await _alog("signals",f"{broker}/{execution_mode}/{asset}/{timeframe} {ticker}: {sig.get('signal')} conf={sig.get('confidence')} reason={sig.get('filter_reason')}","success" if sig["is_actionable"] else "info",{"ticker":ticker,"broker":broker,"mode":execution_mode,"asset_type":asset,"timeframe":timeframe,"interval":interval,"signal":sig.get("signal"),"confidence":sig.get("confidence"),"reason":sig.get("filter_reason")})
     actionable=[x for x in generated if x.get("is_actionable")]; actionable.sort(key=lambda x:(float(x.get("confidence",0) or 0),float(x.get("scanner_score",0) or 0)),reverse=True)
     diagnostics=sorted(generated,key=lambda x:(1 if x.get("is_actionable") else 0,float(x.get("confidence",0) or 0),float(x.get("scanner_score",0) or 0)),reverse=True)[:signal_limit]
     best=actionable[:signal_limit]; store=best if best else diagnostics
-    run={"broker":broker,"execution_mode":execution_mode,"asset_type":asset,"timeframe":timeframe,"interval":interval,"scan_limit":scan_limit,"signal_limit":signal_limit,"min_confidence":min_confidence,"use_ai":use_ai,"discover":discover,"started_at":started,"finished_at":datetime.utcnow().isoformat(),"candidate_count":len(candidates),"generated_count":len(generated),"actionable_count":len(actionable),"best":best,"diagnostics":diagnostics,"stored_count":len(store)}
+    run={"broker":broker,"execution_mode":execution_mode,"asset_type":asset,"timeframe":timeframe,"strategy_mode":timeframe,"interval":interval,"scan_limit":scan_limit,"signal_limit":signal_limit,"min_confidence":min_confidence,"use_ai":use_ai,"discover":discover,"started_at":started,"finished_at":datetime.utcnow().isoformat(),"candidate_count":len(candidates),"generated_count":len(generated),"actionable_count":len(actionable),"best":best,"diagnostics":diagnostics,"stored_count":len(store)}
     await col_auto_signal_runs.insert_one(dict(run)); await col_auto_signals.delete_many({"broker":broker,"execution_mode":execution_mode,"asset_type":asset,"timeframe":timeframe})
-    if store: await col_auto_signals.insert_many([{**x,"timeframe":timeframe,"broker":broker,"execution_mode":execution_mode,"asset_type":asset,"diagnostic_only":not x.get("is_actionable")} for x in store])
-    await _alog("signals",f"Finished auto scan {broker}/{execution_mode}/{asset}: candidates={len(candidates)} generated={len(generated)} actionable={len(actionable)} stored={len(store)}","success" if store else "warning",run)
+    if store: await col_auto_signals.insert_many([{**x,"timeframe":timeframe,"strategy_mode":timeframe,"interval":interval,"broker":broker,"execution_mode":execution_mode,"asset_type":asset,"diagnostic_only":not x.get("is_actionable")} for x in store])
+    await _alog("signals",f"Finished auto scan {broker}/{execution_mode}/{asset}/{timeframe}: candidates={len(candidates)} generated={len(generated)} actionable={len(actionable)} stored={len(store)}","success" if store else "warning",run)
     run.pop("_id",None); return run
 async def scan_all_auto_signals():
-    brokers=await _configured_brokers(); timeframe=os.getenv("AUTO_SIGNAL_TIMEFRAME","swing"); interval=os.getenv("AUTO_SIGNAL_INTERVAL","1d"); scan_limit=int(os.getenv("AUTO_SIGNAL_SCAN_LIMIT","20")); signal_limit=int(os.getenv("AUTO_SIGNAL_LIMIT","10")); min_confidence=float(os.getenv("AUTO_SIGNAL_MIN_CONFIDENCE","55")); max_parallel=int(os.getenv("AUTO_SIGNAL_MAX_PARALLEL","4")); use_ai=_env_bool("AUTO_SIGNAL_USE_AI",True); discover=_env_bool("AUTO_SIGNAL_DISCOVER_UNIVERSE",True)
-    jobs=[(b,_execution_mode_for_broker(b),a) for b in brokers for a in _asset_types_for_broker(b)]; sem=asyncio.Semaphore(max(1,max_parallel))
-    await _alog("signals",f"Full scan plan: {len(jobs)} broker/mode/asset runs",data={"jobs":[{"broker":b,"mode":m,"asset_type":a} for b,m,a in jobs]})
-    async def _one(broker,mode,asset):
+    brokers=await _configured_brokers(); timeframes=_timeframes(); scan_limit=int(os.getenv("AUTO_SIGNAL_SCAN_LIMIT","20")); signal_limit=int(os.getenv("AUTO_SIGNAL_LIMIT","10")); min_confidence=float(os.getenv("AUTO_SIGNAL_MIN_CONFIDENCE","55")); max_parallel=int(os.getenv("AUTO_SIGNAL_MAX_PARALLEL","4")); use_ai=_env_bool("AUTO_SIGNAL_USE_AI",True); discover=_env_bool("AUTO_SIGNAL_DISCOVER_UNIVERSE",True)
+    jobs=[(b,_execution_mode_for_broker(b),a,tf,_interval_for_timeframe(tf)) for b in brokers for a in _asset_types_for_broker(b) for tf in timeframes]; sem=asyncio.Semaphore(max(1,max_parallel))
+    await _alog("signals",f"Full scan plan: {len(jobs)} broker/mode/asset/timeframe runs",data={"timeframes":timeframes,"jobs":[{"broker":b,"mode":m,"asset_type":a,"timeframe":tf,"interval":iv} for b,m,a,tf,iv in jobs]})
+    async def _one(broker,mode,asset,tf,iv):
         async with sem:
-            try: return await scan_auto_signals(broker,asset,timeframe,interval,scan_limit,signal_limit,min_confidence,use_ai,discover,mode)
+            try: return await scan_auto_signals(broker,asset,tf,iv,scan_limit,signal_limit,min_confidence,use_ai,discover,mode)
             except Exception as e:
-                await _alog("signals",f"auto signal scan failed for {broker}/{mode}/{asset}: {e}","error"); log.warning(f"auto signal scan failed for {broker}/{mode}/{asset}: {e}"); return {"broker":broker,"execution_mode":mode,"asset_type":asset,"error":str(e),"finished_at":datetime.utcnow().isoformat()}
-    runs=await asyncio.gather(*(_one(b,m,a) for b,m,a in jobs)); return {"brokers":brokers,"runs":list(runs),"finished_at":datetime.utcnow().isoformat()}
-async def latest_auto_signals(broker_id=None,asset_type=None,limit=50,execution_mode=None):
+                await _alog("signals",f"auto signal scan failed for {broker}/{mode}/{asset}/{tf}: {e}","error"); log.warning(f"auto signal scan failed for {broker}/{mode}/{asset}/{tf}: {e}"); return {"broker":broker,"execution_mode":mode,"asset_type":asset,"timeframe":tf,"interval":iv,"error":str(e),"finished_at":datetime.utcnow().isoformat()}
+    runs=await asyncio.gather(*(_one(b,m,a,tf,iv) for b,m,a,tf,iv in jobs)); return {"brokers":brokers,"timeframes":timeframes,"runs":list(runs),"finished_at":datetime.utcnow().isoformat()}
+async def latest_auto_signals(broker_id=None,asset_type=None,limit=50,execution_mode=None,timeframe=None):
     q={}
     if broker_id: q["broker"]=normalize_broker_id(broker_id)
     if asset_type: q["asset_type"]=asset_type
     if execution_mode: q["execution_mode"]=execution_mode
+    if timeframe: q["timeframe"]=timeframe
     docs=await col_auto_signals.find(q).sort([("is_actionable",-1),("confidence",-1),("created_at",-1)]).limit(limit).to_list(limit)
     for d in docs: d["_id"]=str(d["_id"])
     return docs
