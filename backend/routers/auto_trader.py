@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from middleware.auth import get_current_user, require_admin, scope_filter
 from services.auto_trader import (
     get_config, update_config, scan_and_execute, monitor_open,
-    start_scheduler, stop_scheduler, PROFILE_PRESETS,
+    start_scheduler, stop_scheduler, PROFILE_PRESETS, close_trade_at_market,
 )
 from services import risk_engine
 from services import ttl_cache
@@ -120,6 +120,38 @@ async def monitor(user=Depends(require_admin)):
     except Exception as e:
         await _audit("monitor_failed", "error", {"error":str(e)})
         raise HTTPException(400, str(e))
+
+@router.post("/open-trades/{trade_id}/close")
+async def close_trade(trade_id: str, payload: dict | None = None, user=Depends(require_admin)):
+    reason = (payload or {}).get("reason") or "manual"
+    await _audit("manual_close_requested", data={"user":user.get("email") or user.get("id"),"trade_id":trade_id,"reason":reason})
+    try:
+        res = await close_trade_at_market(trade_id, reason=reason)
+        ttl_cache.clear('autotrader_dashboard'); ttl_cache.clear('autotrader_live'); ttl_cache.clear('trade_history')
+        await _audit("manual_close_done", "success", res)
+        return res
+    except ValueError as e:
+        await _audit("manual_close_failed", "warning", {"error":str(e),"trade_id":trade_id})
+        raise HTTPException(404 if "not found" in str(e).lower() else 400, str(e))
+    except Exception as e:
+        await _audit("manual_close_failed", "error", {"error":str(e),"trade_id":trade_id})
+        raise HTTPException(500, str(e))
+
+@router.post("/open-trades/close-all")
+async def close_all_trades(payload: dict | None = None, user=Depends(require_admin)):
+    reason = (payload or {}).get("reason") or "manual_close_all"
+    q = scope_filter(user, {"status": "open"})
+    open_trades = await db["open_trades"].find(q).to_list(200)
+    await _audit("manual_close_all_requested", data={"user":user.get("email") or user.get("id"),"count":len(open_trades),"reason":reason})
+    results=[]; failed=[]
+    for t in open_trades:
+        try:
+            r=await close_trade_at_market(t["_id"], reason=reason); results.append(r)
+        except Exception as e:
+            failed.append({"trade_id":str(t.get("_id")),"error":str(e)})
+    ttl_cache.clear('autotrader_dashboard'); ttl_cache.clear('autotrader_live'); ttl_cache.clear('trade_history')
+    await _audit("manual_close_all_done","success",{"closed":len(results),"failed":len(failed)})
+    return {"closed":len(results),"failed":len(failed),"results":results,"failures":failed}
 
 @router.get("/audit-logs")
 async def audit_logs(limit:int=Query(100,ge=1,le=500), user=Depends(get_current_user)):

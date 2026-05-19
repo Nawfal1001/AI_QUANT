@@ -18,11 +18,13 @@ except Exception:
 cfg_col=db["autotrader_config"]; trades_col=db["open_trades"]; hist_col=db["trade_history"]; rl_ep_col=db["rl_episodes"]
 # Profile presets — applied (without overwriting user-set values) when profile is selected.
 # Each preset tunes timeframe, max_hold_bars, scan cadence, min_confidence, and risk_per_trade.
+# max_hold_bars is interpreted in *units of the profile's timeframe* (e.g. swing → 1d bars).
+# Tuned so live trades close in: scalping ≤ 1h, intraday ≤ 6h, swing ≤ 7d, position ≤ 4w.
 PROFILE_PRESETS={
     "scalping":{"timeframe":"scalping","scan_interval":120,"min_confidence":72,"risk_per_trade":1.0,"max_hold_bars":12,"sl_atr_mult":1.2,"tp_atr_mult":1.8,"mtf_gate":"strict","partial_tp_atr":1.0,"trail_after_partial":True},
-    "intraday":{"timeframe":"intraday","scan_interval":300,"min_confidence":68,"risk_per_trade":1.5,"max_hold_bars":30,"sl_atr_mult":1.8,"tp_atr_mult":2.6,"mtf_gate":"soft","partial_tp_atr":1.2,"trail_after_partial":True},
-    "swing":{"timeframe":"swing","scan_interval":900,"min_confidence":65,"risk_per_trade":2.0,"max_hold_bars":60,"sl_atr_mult":2.5,"tp_atr_mult":4.0,"mtf_gate":"soft","partial_tp_atr":1.5,"trail_after_partial":True},
-    "position":{"timeframe":"position","scan_interval":3600,"min_confidence":62,"risk_per_trade":2.5,"max_hold_bars":150,"sl_atr_mult":3.5,"tp_atr_mult":6.0,"mtf_gate":"off","partial_tp_atr":2.0,"trail_after_partial":True},
+    "intraday":{"timeframe":"intraday","scan_interval":300,"min_confidence":68,"risk_per_trade":1.5,"max_hold_bars":12,"sl_atr_mult":1.8,"tp_atr_mult":2.6,"mtf_gate":"soft","partial_tp_atr":1.2,"trail_after_partial":True},
+    "swing":{"timeframe":"swing","scan_interval":900,"min_confidence":65,"risk_per_trade":2.0,"max_hold_bars":7,"sl_atr_mult":2.5,"tp_atr_mult":4.0,"mtf_gate":"soft","partial_tp_atr":1.5,"trail_after_partial":True},
+    "position":{"timeframe":"position","scan_interval":3600,"min_confidence":62,"risk_per_trade":2.5,"max_hold_bars":4,"sl_atr_mult":3.5,"tp_atr_mult":6.0,"mtf_gate":"off","partial_tp_atr":2.0,"trail_after_partial":True},
 }
 DEFAULT={"enabled":False,"paper_mode":True,"profile":"swing","leverage":1.0,"min_confidence":70,"max_open":5,"risk_per_trade":2.0,"capital":10000,"timeframe":"swing","scan_interval":300,"signal_source":"hybrid","auto_signal_limit":25,"allow_diagnostic_auto_signals":True,"use_quant":True,"use_stops":True,"use_mtf":True,"use_portfolio_risk":True,"use_rl_agent":True,"use_meta_learner":True,"use_defensive":True,"mtf_gate":"soft","partial_tp_atr":1.5,"trail_after_partial":True,"use_bayesian_online":True,"use_meta_labeler":True,"meta_labeler_threshold":0.45,"meta_labeler_retrain_every":25,"watchlist":[{"ticker":"AAPL","type":"stock"},{"ticker":"NVDA","type":"stock"},{"ticker":"TSLA","type":"stock"},{"ticker":"BTC","type":"crypto"},{"ticker":"ETH","type":"crypto"},{"ticker":"SOL","type":"crypto"}]}
 def _clamp_leverage(v,lo=1.0,hi=125.0):
@@ -215,6 +217,62 @@ async def scan_and_execute():
         await trades_col.insert_one(trade); executed.append({"ticker":ticker,"signal":final_sig,"entry":entry,"size":round(pos_pct,2),"source":item.get("source"),"confidence":final_conf}); open_cnt+=1
         await _alog(f"Opened paper trade from {item.get('source')}: {final_sig} {ticker} conf={final_conf} entry={entry}","success",executed[-1])
     return {"status":"scanned","source":config.get("signal_source","hybrid"),"candidates":len(items),"executed":len(executed),"trades":executed,"skipped":skipped[:50],"rl_decisions":rl_decisions,"defensive_mode":defensive_adj}
+BAR_MINUTES={"1m":1,"5m":5,"15m":15,"30m":30,"1h":60,"4h":240,"1d":1440,"1wk":10080,"1w":10080,"scalping":5,"intraday":30,"swing":1440,"position":10080}
+def _bar_minutes(tf):
+    return BAR_MINUTES.get(str(tf or "swing").lower(),1440)
+async def _current_price(ticker, atype):
+    from services import data_freshness
+    from services.backtest_engine import fetch_history
+    cached=data_freshness.get_price(ticker)
+    if cached and not cached.get("expired"):
+        p=float(cached.get("price",0) or 0)
+        if p>0: return p, "cache"
+    try:
+        end_dt=datetime.utcnow(); start_dt=end_dt-timedelta(days=2)
+        df=await fetch_history(ticker,atype,start_dt.strftime("%Y-%m-%d"),end_dt.strftime("%Y-%m-%d"),"1h")
+        if df is not None and len(df): return float(df["close"].iloc[-1]), "history"
+    except Exception as e: _log.debug(f"price fetch failed for {ticker}: {e}")
+    return 0.0, "unavailable"
+async def close_trade_at_market(trade_id, reason="manual", user_id=None):
+    """Force-close an open trade at the current market price. Used by both the
+    manual close endpoint and the time-exit path inside monitor_open()."""
+    from bson import ObjectId
+    try: oid=ObjectId(str(trade_id))
+    except Exception: raise ValueError("invalid trade id")
+    q={"_id":oid,"status":"open"}
+    if user_id: q["user_id"]=user_id
+    trade=await trades_col.find_one(q)
+    if not trade: raise ValueError("trade not found or already closed")
+    ticker=trade["ticker"]; atype=trade.get("asset_type","stock")
+    sig=trade.get("signal","BUY"); side="BUY" if "BUY" in sig else "SELL"
+    entry=float(trade.get("entry_price",0))
+    price,price_src=await _current_price(ticker,atype)
+    if price<=0: raise ValueError("could not resolve current price")
+    realized_pnl_pct=float(trade.get("realized_pnl_pct",0.0))
+    original_qty=float(trade.get("original_quantity") or trade.get("quantity") or 0)
+    current_qty=float(trade.get("quantity") or original_qty)
+    pnl_remain=(price-entry)/entry*100 if side=="BUY" else (entry-price)/entry*100
+    qty_ratio=current_qty/original_qty if original_qty>0 else 1.0
+    total_pnl=realized_pnl_pct*(1-qty_ratio)+pnl_remain*qty_ratio
+    outcome="WIN" if total_pnl>0 else "LOSS"
+    await trades_col.update_one({"_id":trade["_id"]},{"$set":{"status":"closed","close_price":price,"close_reason":reason,"pnl_pct":round(total_pnl,3),"outcome":outcome,"closed_at":datetime.utcnow().isoformat(),"close_price_source":price_src}})
+    closed_doc={**{k:v for k,v in trade.items() if k!="_id"},"close_price":price,"pnl_pct":round(total_pnl,3),"outcome":outcome,"closed_at":datetime.utcnow().isoformat(),"close_reason":reason,"close_price_source":price_src}
+    await hist_col.insert_one(closed_doc)
+    # Run the same self-learning loops as a natural SL/TP close.
+    try:
+        from services.bayesian_online_weights import update_from_trade as _bo
+        await _bo(closed_doc)
+    except Exception as e: _log.debug(f"bayes online update failed (manual close): {e}")
+    try:
+        from services.weight_engine import update_weights as _we
+        await _we(outcome,sig,trade.get("indicators_at_entry",[]),float(total_pnl),float(trade.get("confidence",50) or 50))
+    except Exception as e: _log.debug(f"weight engine update failed (manual close): {e}")
+    try:
+        from services.bayesian_engine import update_likelihoods_from_outcome as _be
+        await _be(trade.get("regime","RANGING"),trade.get("indicators_at_entry",[]),sig,outcome=="WIN")
+    except Exception as e: _log.debug(f"bayes engine update failed (manual close): {e}")
+    await _alog(f"Trade closed ({reason}) {ticker} @ {price} pnl={total_pnl:.2f}%","success" if total_pnl>0 else "info",{"ticker":ticker,"reason":reason,"pnl_pct":total_pnl,"price_source":price_src})
+    return {"trade_id":str(trade["_id"]),"ticker":ticker,"close_price":price,"close_reason":reason,"pnl_pct":round(total_pnl,3),"outcome":outcome,"price_source":price_src}
 async def monitor_open():
     trades=await trades_col.find({"status":"open"}).to_list(100)
     if not trades: return {"monitored":0}
@@ -248,6 +306,18 @@ async def monitor_open():
                 if df is not None and len(df): price=float(df["close"].iloc[-1])
             except Exception as e: _log.debug(f"monitor price fetch failed for {ticker}: {e}"); continue
         if price<=0: continue
+        # ---- TIME EXIT: close trade once it has exceeded max_hold_bars × bar duration ----
+        tf=str(trade.get("timeframe","swing")).lower()
+        max_hold_bars=int(trade.get("max_hold_bars") or config.get("max_hold_bars",60) or 60)
+        bar_min=_bar_minutes(tf)
+        # Use the larger of profile preset and explicit setting, capped at 30 days for safety.
+        max_hold_minutes=min(60*24*30, max(15, max_hold_bars*bar_min))
+        if elapsed_min>=max_hold_minutes:
+            try:
+                res=await close_trade_at_market(trade["_id"], reason="TIME_EXIT")
+                closed.append({"ticker":ticker,"outcome":res["outcome"],"pnl":res["pnl_pct"],"reason":"TIME_EXIT","elapsed_min":round(elapsed_min,1),"max_hold_min":max_hold_minutes})
+            except Exception as e: _log.debug(f"time-exit failed for {ticker}: {e}")
+            continue
         hit_sl=price<=sl if side=="BUY" else price>=sl
         hit_tp=price>=tp if side=="BUY" else price<=tp
         if hit_sl or hit_tp:
