@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from middleware.auth import get_current_user, scope_filter
 from services.backtest_engine import fetch_history, run_backtest, run_compare
 from services.optuna_optimizer import optimize_backtest
-from services.universal_backtest import run_universal_backtest, optimize_universal
+from services.universal_backtest import run_universal_backtest, optimize_universal, walk_forward_universal
 from services.universal_strategy import UNIVERSAL_PARAM_SPACE, DEFAULT_PARAMS as UNIVERSAL_DEFAULTS
 from services.strategies import list_strategies
 from services.logger import child
@@ -153,5 +153,27 @@ async def universal_optimize(req:dict,user=Depends(get_current_user)):
             await _job_log(job_id,"Universal Optuna optimisation completed.","success")
         except Exception as e:
             log.exception(f"universal optuna failed: {e}"); await _job_log(job_id,f"Failed: {e}","error"); await _set_progress(job_id,"failed",100,error=str(e))
+    asyncio.create_task(_run())
+    return {"job_id":job_id,"status":"queued","progress":0}
+
+@router.post("/universal/walkforward")
+async def universal_walkforward(req:dict,user=Depends(get_current_user)):
+    _validate_universal(req)
+    folds=int(req.get("folds",3))
+    if folds<2 or folds>10: raise HTTPException(400,"folds must be 2..10")
+    job_id=str(uuid.uuid4())
+    await jobs.insert_one({"job_id":job_id,"user_id":user["id"],"status":"queued","progress":0,"logs":[{"ts":_now(),"level":"info","message":"Queued walk-forward Optuna job.","data":{}}],"request":req,"created_at":_now(),"updated_at":_now()})
+    async def _run():
+        try:
+            await _set_progress(job_id,"running",5)
+            async def lf(msg,level="info",data=None): await _job_log(job_id,msg,level,data)
+            async def pf(p): await _set_progress(job_id,"running",p)
+            opt=await walk_forward_universal(req,user,log_fn=lf,progress_fn=pf)
+            if opt.get("error"):
+                await _set_progress(job_id,"failed",100,result=opt,error=opt["error"]); return
+            await _set_progress(job_id,"completed",100,result=opt)
+            await _job_log(job_id,"Walk-forward optimisation completed.","success")
+        except Exception as e:
+            log.exception(f"walk-forward failed: {e}"); await _job_log(job_id,f"Failed: {e}","error"); await _set_progress(job_id,"failed",100,error=str(e))
     asyncio.create_task(_run())
     return {"job_id":job_id,"status":"queued","progress":0}

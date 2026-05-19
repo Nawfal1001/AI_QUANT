@@ -19,12 +19,12 @@ cfg_col=db["autotrader_config"]; trades_col=db["open_trades"]; hist_col=db["trad
 # Profile presets — applied (without overwriting user-set values) when profile is selected.
 # Each preset tunes timeframe, max_hold_bars, scan cadence, min_confidence, and risk_per_trade.
 PROFILE_PRESETS={
-    "scalping":{"timeframe":"scalping","scan_interval":120,"min_confidence":72,"risk_per_trade":1.0,"max_hold_bars":12,"sl_atr_mult":1.2,"tp_atr_mult":1.8},
-    "intraday":{"timeframe":"intraday","scan_interval":300,"min_confidence":68,"risk_per_trade":1.5,"max_hold_bars":30,"sl_atr_mult":1.8,"tp_atr_mult":2.6},
-    "swing":{"timeframe":"swing","scan_interval":900,"min_confidence":65,"risk_per_trade":2.0,"max_hold_bars":60,"sl_atr_mult":2.5,"tp_atr_mult":4.0},
-    "position":{"timeframe":"position","scan_interval":3600,"min_confidence":62,"risk_per_trade":2.5,"max_hold_bars":150,"sl_atr_mult":3.5,"tp_atr_mult":6.0},
+    "scalping":{"timeframe":"scalping","scan_interval":120,"min_confidence":72,"risk_per_trade":1.0,"max_hold_bars":12,"sl_atr_mult":1.2,"tp_atr_mult":1.8,"mtf_gate":"strict","partial_tp_atr":1.0,"trail_after_partial":True},
+    "intraday":{"timeframe":"intraday","scan_interval":300,"min_confidence":68,"risk_per_trade":1.5,"max_hold_bars":30,"sl_atr_mult":1.8,"tp_atr_mult":2.6,"mtf_gate":"soft","partial_tp_atr":1.2,"trail_after_partial":True},
+    "swing":{"timeframe":"swing","scan_interval":900,"min_confidence":65,"risk_per_trade":2.0,"max_hold_bars":60,"sl_atr_mult":2.5,"tp_atr_mult":4.0,"mtf_gate":"soft","partial_tp_atr":1.5,"trail_after_partial":True},
+    "position":{"timeframe":"position","scan_interval":3600,"min_confidence":62,"risk_per_trade":2.5,"max_hold_bars":150,"sl_atr_mult":3.5,"tp_atr_mult":6.0,"mtf_gate":"off","partial_tp_atr":2.0,"trail_after_partial":True},
 }
-DEFAULT={"enabled":False,"paper_mode":True,"profile":"swing","leverage":1.0,"min_confidence":70,"max_open":5,"risk_per_trade":2.0,"capital":10000,"timeframe":"swing","scan_interval":300,"signal_source":"hybrid","auto_signal_limit":25,"allow_diagnostic_auto_signals":True,"use_quant":True,"use_stops":True,"use_mtf":True,"use_portfolio_risk":True,"use_rl_agent":True,"use_meta_learner":True,"use_defensive":True,"watchlist":[{"ticker":"AAPL","type":"stock"},{"ticker":"NVDA","type":"stock"},{"ticker":"TSLA","type":"stock"},{"ticker":"BTC","type":"crypto"},{"ticker":"ETH","type":"crypto"},{"ticker":"SOL","type":"crypto"}]}
+DEFAULT={"enabled":False,"paper_mode":True,"profile":"swing","leverage":1.0,"min_confidence":70,"max_open":5,"risk_per_trade":2.0,"capital":10000,"timeframe":"swing","scan_interval":300,"signal_source":"hybrid","auto_signal_limit":25,"allow_diagnostic_auto_signals":True,"use_quant":True,"use_stops":True,"use_mtf":True,"use_portfolio_risk":True,"use_rl_agent":True,"use_meta_learner":True,"use_defensive":True,"mtf_gate":"soft","partial_tp_atr":1.5,"trail_after_partial":True,"watchlist":[{"ticker":"AAPL","type":"stock"},{"ticker":"NVDA","type":"stock"},{"ticker":"TSLA","type":"stock"},{"ticker":"BTC","type":"crypto"},{"ticker":"ETH","type":"crypto"},{"ticker":"SOL","type":"crypto"}]}
 def _clamp_leverage(v,lo=1.0,hi=125.0):
     try: x=float(v)
     except Exception: return 1.0
@@ -75,6 +75,30 @@ async def _latest_auto_signal_items(config,min_c):
         sig={k:v for k,v in d.items() if k!="_id"}; sig["_id"]=str(d.get("_id",""))
         items.append({"ticker":ticker,"type":atype,"source":"auto_signals","signal_payload":sig})
     return items
+async def _mtf_confirmation(ticker, base_timeframe, direction):
+    """Look up the most recent higher-timeframe auto_signal for the same ticker.
+
+    Returns ("agree"|"disagree"|"missing", htf_doc_or_None). Used to gate or
+    boost confidence before opening a trade.
+    """
+    try:
+        from services.signal_service import MTF_CONFIRMATIONS
+    except Exception:
+        return "missing", None
+    htfs = MTF_CONFIRMATIONS.get(base_timeframe, []) or []
+    if not htfs:
+        return "missing", None
+    doc = await db["auto_signals"].find_one(
+        {"ticker": ticker, "timeframe": {"$in": htfs}, "signal": {"$regex": "BUY|SELL", "$options": "i"}},
+        sort=[("created_at", -1)],
+    )
+    if not doc:
+        return "missing", None
+    htf_sig = str(doc.get("signal", "")).upper()
+    htf_dir = "BUY" if "BUY" in htf_sig else "SELL" if "SELL" in htf_sig else "HOLD"
+    if htf_dir == "HOLD":
+        return "missing", doc
+    return ("agree" if htf_dir == direction else "disagree"), doc
 async def _candidate_items(config,min_c):
     auto_items=await _latest_auto_signal_items(config,min_c)
     source=config.get("signal_source",os.getenv("AUTOTRADER_SIGNAL_SOURCE","hybrid"))
@@ -122,6 +146,20 @@ async def scan_and_execute():
         if "BUY" not in sig_txt and "SELL" not in sig_txt: skipped.append({"ticker":ticker,"reason":"not_buy_sell","signal":sig.get("signal")}); continue
         regime=sig.get("regime","RANGING")
         if allowed_regimes and regime not in allowed_regimes: skipped.append({"ticker":ticker,"reason":"regime_blocked","regime":regime}); continue
+        # ---- Higher-timeframe confirmation gate ----
+        mtf_mode=str(config.get("mtf_gate","soft")).lower()
+        mtf_status="off"; mtf_doc=None; mtf_conf_adj=0
+        if mtf_mode in {"soft","strict"}:
+            entry_dir="BUY" if "BUY" in sig_txt else "SELL"
+            base_tf=str(sig.get("timeframe",tf) or tf).lower()
+            mtf_status,mtf_doc=await _mtf_confirmation(ticker,base_tf,entry_dir)
+            if mtf_status=="disagree":
+                if mtf_mode=="strict":
+                    skipped.append({"ticker":ticker,"reason":"mtf_disagree","htf":(mtf_doc or {}).get("timeframe"),"htf_signal":(mtf_doc or {}).get("signal")}); continue
+                mtf_conf_adj=-10  # soft: dampen, still continue
+            elif mtf_status=="agree":
+                mtf_conf_adj=+5
+            # missing → no change
         meta=sig.get("meta_learner",{}) or {}
         if item.get("source")!="auto_signals" and config.get("use_meta_learner",True) and meta.get("available") and meta.get("recommend")=="SKIP": skipped.append({"ticker":ticker,"reason":"meta_skip"}); continue
         history=await hist_col.find({}).sort("closed_at",-1).limit(50).to_list(50); wins=[t["pnl_pct"] for t in history if t.get("outcome")=="WIN" and t.get("pnl_pct")]; losses=[t["pnl_pct"] for t in history if t.get("outcome")=="LOSS" and t.get("pnl_pct")]; wr=len(wins)/len(history) if history else 0.55; aw=sum(wins)/len(wins) if wins else 2.0; al=sum(losses)/len(losses) if losses else -1.5; trade_ret=[t.get("pnl_pct",0) for t in history]; eq=[capital]; r=capital
@@ -140,7 +178,9 @@ async def scan_and_execute():
         else: pos_pct=config.get("risk_per_trade",2.0)
         leverage=_clamp_leverage(config.get("leverage",1.0))
         pos_pct=pos_pct*rl_size_mult*size_mult
-        final_sig=sig["signal"]; final_conf=conf
+        final_sig=sig["signal"]; final_conf=max(0,min(95,conf+mtf_conf_adj))
+        if mtf_conf_adj<0 and final_conf<float(min_c):
+            skipped.append({"ticker":ticker,"reason":"mtf_soft_below_min","confidence":final_conf,"min_confidence":min_c,"htf":(mtf_doc or {}).get("timeframe")}); continue
         entry=float(sig.get("price") or sig.get("entry_price") or 0)
         if entry<=0: skipped.append({"ticker":ticker,"reason":"missing_price"}); continue
         # Leverage multiplies notional exposure for a given margin (position_pct of capital).
@@ -148,7 +188,7 @@ async def scan_and_execute():
         if config.get("use_stops",True) and item.get("source")!="auto_signals": sl=optimal_trailing_stop(entry,entry,atr_val,0,200,"long" if "BUY" in final_sig else "short")["optimal_stop"]
         else: sl=float(sig.get("sl") or entry*(0.97 if "BUY" in final_sig else 1.03))
         tp=float(sig.get("tp") or entry*(1.06 if "BUY" in final_sig else 0.94))
-        trade={"ticker":ticker,"asset_type":atype,"signal":final_sig,"confidence":final_conf,"entry_price":entry,"quantity":round(qty,6),"position_value":round(capital*pos_pct/100*leverage,2),"margin_used":round(capital*pos_pct/100,2),"leverage":leverage,"profile":config.get("profile"),"position_pct":round(pos_pct,2),"sl":round(sl,4),"tp":round(tp,4),"atr":round(atr_val,4),"regime":regime,"timeframe":sig.get("timeframe",tf),"status":"open","paper_mode":config.get("paper_mode",True),"opened_at":datetime.utcnow().isoformat(),"source":item.get("source"),"auto_signal_id":str(sig.get("_id","")),"diagnostic_source":bool(sig.get("diagnostic_only")),"scanner_score":sig.get("scanner_score"),"quant_powered":config.get("use_quant",True),"rl_state":rl_state_key,"rl_action":rl_action_idx,"rl_size_mult":rl_size_mult,"meta_p_win":meta.get("p_win",None),"indicators_at_entry":sig.get("indicators",[]),"enhancements_at_entry":sig.get("enhancements",{}),"entropy_tradeable":next((i.get("tradeable",True) for i in sig.get("indicators",[]) if i.get("indicator")=="ENTROPY"),True)}
+        trade={"ticker":ticker,"asset_type":atype,"signal":final_sig,"confidence":final_conf,"entry_price":entry,"quantity":round(qty,6),"original_quantity":round(qty,6),"position_value":round(capital*pos_pct/100*leverage,2),"margin_used":round(capital*pos_pct/100,2),"leverage":leverage,"profile":config.get("profile"),"position_pct":round(pos_pct,2),"sl":round(sl,4),"initial_sl":round(sl,4),"tp":round(tp,4),"atr":round(atr_val,4),"partial_taken":False,"realized_pnl_pct":0.0,"trailing_active":False,"mtf_status":mtf_status,"mtf_htf_timeframe":(mtf_doc or {}).get("timeframe"),"mtf_htf_signal":(mtf_doc or {}).get("signal"),"mtf_confidence_adj":mtf_conf_adj,"regime":regime,"timeframe":sig.get("timeframe",tf),"status":"open","paper_mode":config.get("paper_mode",True),"opened_at":datetime.utcnow().isoformat(),"source":item.get("source"),"auto_signal_id":str(sig.get("_id","")),"diagnostic_source":bool(sig.get("diagnostic_only")),"scanner_score":sig.get("scanner_score"),"quant_powered":config.get("use_quant",True),"rl_state":rl_state_key,"rl_action":rl_action_idx,"rl_size_mult":rl_size_mult,"meta_p_win":meta.get("p_win",None),"indicators_at_entry":sig.get("indicators",[]),"enhancements_at_entry":sig.get("enhancements",{}),"entropy_tradeable":next((i.get("tradeable",True) for i in sig.get("indicators",[]) if i.get("indicator")=="ENTROPY"),True)}
         await trades_col.insert_one(trade); executed.append({"ticker":ticker,"signal":final_sig,"entry":entry,"size":round(pos_pct,2),"source":item.get("source"),"confidence":final_conf}); open_cnt+=1
         await _alog(f"Opened paper trade from {item.get('source')}: {final_sig} {ticker} conf={final_conf} entry={entry}","success",executed[-1])
     return {"status":"scanned","source":config.get("signal_source","hybrid"),"candidates":len(items),"executed":len(executed),"trades":executed,"skipped":skipped[:50],"rl_decisions":rl_decisions,"defensive_mode":defensive_adj}
@@ -157,9 +197,27 @@ async def monitor_open():
     if not trades: return {"monitored":0}
     from services import data_freshness
     from services.backtest_engine import fetch_history
-    closed=[]
+    config=await get_config()
+    partial_tp_atr=float(config.get("partial_tp_atr",1.5))
+    trail_after_partial=bool(config.get("trail_after_partial",True))
+    closed=[]; partials=[]; trailed=[]
     for trade in trades:
-        ticker=trade["ticker"]; atype=trade.get("asset_type","stock"); entry=float(trade.get("entry_price",0)); sl=float(trade.get("sl",0)); tp=float(trade.get("tp",0)); sig=trade.get("signal","BUY"); price=0.0; cached=data_freshness.get_price(ticker)
+        ticker=trade["ticker"]; atype=trade.get("asset_type","stock")
+        entry=float(trade.get("entry_price",0))
+        sl=float(trade.get("sl",0)); tp=float(trade.get("tp",0))
+        sig=trade.get("signal","BUY"); side="BUY" if "BUY" in sig else "SELL"
+        atr_val=float(trade.get("atr") or entry*0.02)
+        partial_taken=bool(trade.get("partial_taken",False))
+        original_qty=float(trade.get("original_quantity") or trade.get("quantity") or 0)
+        current_qty=float(trade.get("quantity") or original_qty)
+        realized_pnl_pct=float(trade.get("realized_pnl_pct",0.0))
+        # opened_at → elapsed bars proxy
+        try:
+            opened=datetime.fromisoformat(trade.get("opened_at","").replace("Z",""))
+            elapsed_min=max(0,(datetime.utcnow()-opened).total_seconds()/60)
+        except Exception:
+            elapsed_min=0
+        price=0.0; cached=data_freshness.get_price(ticker)
         if cached and not cached.get("expired"): price=float(cached.get("price",0) or 0)
         if price<=0:
             try:
@@ -167,12 +225,42 @@ async def monitor_open():
                 if df is not None and len(df): price=float(df["close"].iloc[-1])
             except Exception as e: _log.debug(f"monitor price fetch failed for {ticker}: {e}"); continue
         if price<=0: continue
-        hit_sl=price<=sl if "BUY" in sig else price>=sl; hit_tp=price>=tp if "BUY" in sig else price<=tp
+        hit_sl=price<=sl if side=="BUY" else price>=sl
+        hit_tp=price>=tp if side=="BUY" else price<=tp
         if hit_sl or hit_tp:
-            pnl=(price-entry)/entry*100 if "BUY" in sig else (entry-price)/entry*100; outcome="WIN" if hit_tp else "LOSS"; close_reason="TP" if hit_tp else "SL"
-            await trades_col.update_one({"_id":trade["_id"]},{"$set":{"status":"closed","close_price":price,"close_reason":close_reason,"pnl_pct":round(pnl,3),"outcome":outcome,"closed_at":datetime.utcnow().isoformat()}})
-            await hist_col.insert_one({**{k:v for k,v in trade.items() if k!="_id"},"close_price":price,"pnl_pct":round(pnl,3),"outcome":outcome,"closed_at":datetime.utcnow().isoformat()}); closed.append({"ticker":ticker,"outcome":outcome,"pnl":round(pnl,3)})
-    return {"monitored":len(trades),"closed":len(closed),"details":closed}
+            pnl_remain=(price-entry)/entry*100 if side=="BUY" else (entry-price)/entry*100
+            # qty-weighted: realised partial (50% leg) + remaining leg
+            qty_ratio=current_qty/original_qty if original_qty>0 else 1.0
+            total_pnl=realized_pnl_pct*(1-qty_ratio)+pnl_remain*qty_ratio
+            outcome="WIN" if total_pnl>0 else "LOSS"
+            close_reason="TRAIL" if hit_sl and bool(trade.get("trailing_active")) else ("TP" if hit_tp else "SL")
+            await trades_col.update_one({"_id":trade["_id"]},{"$set":{"status":"closed","close_price":price,"close_reason":close_reason,"pnl_pct":round(total_pnl,3),"outcome":outcome,"closed_at":datetime.utcnow().isoformat()}})
+            await hist_col.insert_one({**{k:v for k,v in trade.items() if k!="_id"},"close_price":price,"pnl_pct":round(total_pnl,3),"outcome":outcome,"closed_at":datetime.utcnow().isoformat(),"close_reason":close_reason})
+            closed.append({"ticker":ticker,"outcome":outcome,"pnl":round(total_pnl,3),"reason":close_reason})
+            continue
+        # ---- Partial take-profit at +Nx ATR ----
+        unreal_per_unit=(price-entry) if side=="BUY" else (entry-price)
+        partial_trigger=atr_val*partial_tp_atr
+        if not partial_taken and atr_val>0 and unreal_per_unit>=partial_trigger:
+            half_qty=current_qty/2
+            partial_pnl_pct=(price-entry)/entry*100 if side=="BUY" else (entry-price)/entry*100
+            new_sl=entry  # move to breakeven after partial
+            await trades_col.update_one({"_id":trade["_id"]},{"$set":{"quantity":round(current_qty-half_qty,8),"partial_taken":True,"realized_pnl_pct":round(partial_pnl_pct,3),"sl":round(new_sl,6),"trailing_active":True,"partial_taken_at":datetime.utcnow().isoformat(),"partial_price":price}})
+            partials.append({"ticker":ticker,"price":price,"pnl_pct":round(partial_pnl_pct,3)})
+            await _alog(f"Partial TP {ticker}: +{partial_pnl_pct:.2f}% (50% closed, SL→BE)","success",partials[-1])
+            sl=new_sl; partial_taken=True; current_qty-=half_qty
+        # ---- ATR trailing stop (active after partial OR on long-running trades) ----
+        if config.get("use_stops",True) and (partial_taken or elapsed_min>15):
+            try:
+                ts=optimal_trailing_stop(entry,price,atr_val,int(elapsed_min),max(60,int(config.get("max_hold_bars",60))*5),"long" if side=="BUY" else "short")
+                new_stop=float(ts.get("optimal_stop",sl))
+                improved=(side=="BUY" and new_stop>sl) or (side=="SELL" and new_stop<sl)
+                if improved:
+                    await trades_col.update_one({"_id":trade["_id"]},{"$set":{"sl":round(new_stop,6),"trailing_active":True}})
+                    trailed.append({"ticker":ticker,"old_sl":sl,"new_sl":round(new_stop,6),"price":price})
+            except Exception as e:
+                _log.debug(f"trail update failed for {ticker}: {e}")
+    return {"monitored":len(trades),"closed":len(closed),"partials":len(partials),"trailed":len(trailed),"details":closed,"partial_details":partials,"trail_details":trailed}
 _running=False
 async def start_scheduler():
     global _running

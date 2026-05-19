@@ -197,6 +197,211 @@ async def run_universal_backtest(req: dict):
     }
 
 
+def _fold_windows(total_days: int, n_folds: int):
+    """Return list of (in_sample_days, oos_days) starting offsets for walk-forward.
+
+    Splits the lookback into `n_folds+1` equal slabs; fold k optimises on slabs
+    0..k (inclusive) and tests on slab k+1.  Returns tuples of
+    (is_start_days_ago, is_end_days_ago, oos_start_days_ago, oos_end_days_ago)
+    where days_ago=0 means today.
+    """
+    n_folds = max(2, int(n_folds))
+    slab = max(1, total_days // (n_folds + 1))
+    out = []
+    for k in range(n_folds):
+        is_start = total_days
+        is_end = total_days - slab * (k + 1)
+        oos_start = is_end
+        oos_end = max(0, is_end - slab)
+        if oos_start - oos_end < 5:
+            continue
+        out.append((is_start, is_end, oos_start, oos_end))
+    return out
+
+
+def _date_range(days_ago_from: int, days_ago_to: int):
+    end = (datetime.now() - timedelta(days=days_ago_to)).strftime("%Y-%m-%d")
+    start = (datetime.now() - timedelta(days=days_ago_from)).strftime("%Y-%m-%d")
+    return start, end
+
+
+async def walk_forward_universal(req: dict, user: dict, log_fn=None, progress_fn=None):
+    """Walk-forward Optuna: optimise on rolling in-sample folds, score on next OOS fold.
+
+    Returns per-fold breakdown + the param set with the best mean OOS score.
+    This guards against overfitting that single in-sample Optuna runs are prone to.
+    """
+    symbols = _normalize_symbols(req.get("symbols") or req.get("tickers")) or [
+        {"ticker": (req.get("ticker") or "AAPL").upper(), "asset_type": req.get("asset_type", "stock")}
+    ]
+    intervals = _normalize_intervals(req.get("intervals") or req.get("timeframes") or req.get("interval"))
+    days = int(req.get("days", 365))
+    n_folds = int(req.get("folds", 3))
+    n_trials_per_fold = max(5, min(int(req.get("optuna_trials", req.get("trials", 20))), 200))
+    objective_name = req.get("objective", "balanced")
+    fixed_params = req.get("fixed_params") or {}
+
+    windows = _fold_windows(days, n_folds)
+    if not windows:
+        return {"error": f"walk-forward needs days/folds large enough for ≥1 fold; got days={days} folds={n_folds}"}
+
+    fold_results = []
+    candidate_params = []
+
+    async def evaluate(params, start, end):
+        # Pass start/end via days math; backtest_engine recomputes from req days,
+        # so we override by setting `days` so caller respects the window.
+        # Easier path: temporarily build the req with `days_window=(start,end)` and call run_backtest directly.
+        sub_req = dict(req)
+        sub_req["_start"] = start
+        sub_req["_end"] = end
+        return await _run_universal_with_dates(sub_req, params, symbols, intervals)
+
+    for f_idx, (is_s, is_e, oos_s, oos_e) in enumerate(windows):
+        is_start, is_end = _date_range(is_s, is_e)
+        oos_start, oos_end = _date_range(oos_s, oos_e)
+        if log_fn:
+            await log_fn(
+                f"Fold {f_idx+1}/{len(windows)}: IS {is_start}→{is_end}, OOS {oos_start}→{oos_end}"
+            )
+
+        # In-sample Optuna study
+        trials_out = []
+
+        async def is_objective(trial):
+            params = _suggest_params(trial, fixed_params=fixed_params)
+            result = await evaluate(params, is_start, is_end)
+            score = _score(result.get("aggregate") or {}, objective_name)
+            trials_out.append({"number": trial.number, "score": score, "params": params, "aggregate": result.get("aggregate")})
+            return score
+
+        study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42 + f_idx))
+        for _ in range(n_trials_per_fold):
+            trial = study.ask()
+            value = await is_objective(trial)
+            study.tell(trial, value)
+        best_is_params = {**DEFAULT_PARAMS, **study.best_params}
+
+        # OOS test
+        oos_result = await evaluate(best_is_params, oos_start, oos_end)
+        oos_agg = oos_result.get("aggregate") or {}
+        oos_score = _score(oos_agg, objective_name)
+
+        fold_results.append(
+            {
+                "fold": f_idx + 1,
+                "is_window": [is_start, is_end],
+                "oos_window": [oos_start, oos_end],
+                "is_best_score": float(study.best_value),
+                "oos_score": float(oos_score),
+                "oos_aggregate": oos_agg,
+                "params": best_is_params,
+                "trials": trials_out,
+            }
+        )
+        candidate_params.append((best_is_params, float(oos_score)))
+        if progress_fn:
+            await progress_fn(5 + int(((f_idx + 1) / len(windows)) * 85))
+
+    # Pick params with the best mean OOS score across folds — same params may win
+    # multiple folds (Optuna seeded). We average for the chosen best.
+    by_params = {}
+    for params, score in candidate_params:
+        key = tuple(sorted(params.items()))
+        by_params.setdefault(key, []).append(score)
+    best_key, best_scores = max(by_params.items(), key=lambda kv: sum(kv[1]) / len(kv[1]))
+    best_params = dict(best_key)
+    mean_oos = sum(best_scores) / len(best_scores)
+
+    # Final eval on full window with the chosen params
+    full_start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    full_end = datetime.now().strftime("%Y-%m-%d")
+    final = await _run_universal_with_dates(req, best_params, symbols, intervals, full_start, full_end)
+
+    suggestion = None
+    try:
+        doc = {
+            "user_id": str(user.get("id") or user.get("_id") or user.get("email") or "global") if isinstance(user, dict) else "global",
+            "source": "optuna_universal_walkforward",
+            "status": "suggested",
+            "strategy": "universal",
+            "objective": objective_name,
+            "symbols": symbols,
+            "intervals": intervals,
+            "folds": [
+                {k: v for k, v in f.items() if k != "trials"} for f in fold_results
+            ],
+            "best_params": best_params,
+            "mean_oos_score": float(mean_oos),
+            "final_aggregate": final.get("aggregate"),
+            "bot_config_suggestion": {
+                "strategy_id": "universal",
+                "strategy_params": best_params,
+                "symbols": symbols,
+                "intervals": intervals,
+                "min_confidence": int(req.get("min_confidence", 55)),
+                "sizing_mode": "fixed_pct",
+                "sizing_pct": float(req.get("risk_per_trade", 0.02)) * 100,
+            },
+            "created_at": datetime.utcnow().isoformat(),
+        }
+        res = await col_suggestions.insert_one(doc)
+        doc["_id"] = str(res.inserted_id)
+        suggestion = doc
+    except Exception as e:
+        if log_fn:
+            await log_fn(f"Could not save walk-forward suggestion: {e}", level="warning")
+
+    if log_fn:
+        await log_fn(
+            f"Walk-forward complete. Best mean OOS score={mean_oos:.3f} across {len(windows)} folds.",
+            level="success",
+        )
+
+    return {
+        "mode": "optuna_universal_walkforward",
+        "symbols": symbols,
+        "intervals": intervals,
+        "days": days,
+        "folds": fold_results,
+        "best_params": best_params,
+        "mean_oos_score": float(mean_oos),
+        "final": final,
+        "suggestion": suggestion,
+    }
+
+
+async def _run_universal_with_dates(req, params, symbols, intervals, start=None, end=None):
+    """Helper: run universal multi-leg backtest over an explicit date window."""
+    start = start or req.get("_start") or (datetime.now() - timedelta(days=int(req.get("days", 365)))).strftime("%Y-%m-%d")
+    end = end or req.get("_end") or datetime.now().strftime("%Y-%m-%d")
+    run_kwargs = dict(
+        initial_capital=float(req.get("capital", 10000)),
+        risk_per_trade=float(req.get("risk_per_trade", 0.02)),
+        min_confidence=int(req.get("min_confidence", 55)),
+        sl_atr_mult=float(req.get("sl_atr_mult", 2.0)),
+        tp_atr_mult=float(req.get("tp_atr_mult", 3.0)),
+        fee_bps=float(req.get("fee_bps", 5)),
+        slippage_bps=float(req.get("slippage_bps", 3)),
+        spread_bps=float(req.get("spread_bps", 2)),
+        max_hold_bars=int(req.get("max_hold_bars", 30)),
+    )
+    max_parallel = max(1, int(req.get("max_parallel", 4)))
+    sem = asyncio.Semaphore(max_parallel)
+
+    async def _bound(symbol, interval):
+        async with sem:
+            try:
+                r = await _run_leg(symbol, interval, start, end, params, run_kwargs)
+            except Exception as e:
+                r = {"error": str(e)}
+            r["leg"] = {"ticker": symbol["ticker"], "asset_type": symbol["asset_type"], "interval": interval}
+            return r
+
+    legs = await asyncio.gather(*[_bound(s, iv) for s in symbols for iv in intervals])
+    return {"aggregate": _aggregate(legs), "legs": legs}
+
+
 async def optimize_universal(req: dict, user: dict, log_fn=None, progress_fn=None):
     """Optuna optimisation of the universal strategy across symbols x timeframes."""
     symbols = _normalize_symbols(req.get("symbols") or req.get("tickers")) or [{"ticker": (req.get("ticker") or "AAPL").upper(), "asset_type": req.get("asset_type", "stock")}]
