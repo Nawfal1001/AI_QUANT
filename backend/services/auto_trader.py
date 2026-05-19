@@ -24,7 +24,7 @@ PROFILE_PRESETS={
     "swing":{"timeframe":"swing","scan_interval":900,"min_confidence":65,"risk_per_trade":2.0,"max_hold_bars":60,"sl_atr_mult":2.5,"tp_atr_mult":4.0,"mtf_gate":"soft","partial_tp_atr":1.5,"trail_after_partial":True},
     "position":{"timeframe":"position","scan_interval":3600,"min_confidence":62,"risk_per_trade":2.5,"max_hold_bars":150,"sl_atr_mult":3.5,"tp_atr_mult":6.0,"mtf_gate":"off","partial_tp_atr":2.0,"trail_after_partial":True},
 }
-DEFAULT={"enabled":False,"paper_mode":True,"profile":"swing","leverage":1.0,"min_confidence":70,"max_open":5,"risk_per_trade":2.0,"capital":10000,"timeframe":"swing","scan_interval":300,"signal_source":"hybrid","auto_signal_limit":25,"allow_diagnostic_auto_signals":True,"use_quant":True,"use_stops":True,"use_mtf":True,"use_portfolio_risk":True,"use_rl_agent":True,"use_meta_learner":True,"use_defensive":True,"mtf_gate":"soft","partial_tp_atr":1.5,"trail_after_partial":True,"watchlist":[{"ticker":"AAPL","type":"stock"},{"ticker":"NVDA","type":"stock"},{"ticker":"TSLA","type":"stock"},{"ticker":"BTC","type":"crypto"},{"ticker":"ETH","type":"crypto"},{"ticker":"SOL","type":"crypto"}]}
+DEFAULT={"enabled":False,"paper_mode":True,"profile":"swing","leverage":1.0,"min_confidence":70,"max_open":5,"risk_per_trade":2.0,"capital":10000,"timeframe":"swing","scan_interval":300,"signal_source":"hybrid","auto_signal_limit":25,"allow_diagnostic_auto_signals":True,"use_quant":True,"use_stops":True,"use_mtf":True,"use_portfolio_risk":True,"use_rl_agent":True,"use_meta_learner":True,"use_defensive":True,"mtf_gate":"soft","partial_tp_atr":1.5,"trail_after_partial":True,"use_bayesian_online":True,"use_meta_labeler":True,"meta_labeler_threshold":0.45,"meta_labeler_retrain_every":25,"watchlist":[{"ticker":"AAPL","type":"stock"},{"ticker":"NVDA","type":"stock"},{"ticker":"TSLA","type":"stock"},{"ticker":"BTC","type":"crypto"},{"ticker":"ETH","type":"crypto"},{"ticker":"SOL","type":"crypto"}]}
 def _clamp_leverage(v,lo=1.0,hi=125.0):
     try: x=float(v)
     except Exception: return 1.0
@@ -181,6 +181,29 @@ async def scan_and_execute():
         final_sig=sig["signal"]; final_conf=max(0,min(95,conf+mtf_conf_adj))
         if mtf_conf_adj<0 and final_conf<float(min_c):
             skipped.append({"ticker":ticker,"reason":"mtf_soft_below_min","confidence":final_conf,"min_confidence":min_c,"htf":(mtf_doc or {}).get("timeframe")}); continue
+        # ---- Bayesian online weights: scale confidence by per-indicator reliability ----
+        bayes_mult=1.0; bayes_eval={"evaluated":0}
+        if config.get("use_bayesian_online",True):
+            try:
+                from services.bayesian_online_weights import confidence_multiplier
+                entry_dir="BUY" if "BUY" in sig_txt else "SELL"
+                bayes_eval=await confidence_multiplier(regime,entry_dir,sig.get("indicators",[]))
+                bayes_mult=float(bayes_eval.get("multiplier",1.0) or 1.0)
+                final_conf=max(0,min(95,final_conf*bayes_mult))
+                if final_conf<float(min_c):
+                    skipped.append({"ticker":ticker,"reason":"bayesian_below_min","confidence":round(final_conf,2),"min_confidence":min_c,"multiplier":bayes_mult,"drag":bayes_eval.get("drag_terms")}); continue
+            except Exception as e: _log.debug(f"bayesian online weights skipped: {e}")
+        # ---- Meta-labeller gate: P(win) from learned classifier on signal metadata ----
+        meta_score={"p_win":None,"kind":"disabled","ready":False}
+        if config.get("use_meta_labeler",True):
+            try:
+                from services.meta_labeler import should_trade as meta_should_trade
+                feature_row=dict(sig); feature_row["confidence"]=final_conf; feature_row["regime"]=regime; feature_row["signal"]=final_sig; feature_row["leverage"]=config.get("leverage",1.0); feature_row["mtf_status"]=mtf_status
+                feature_row.setdefault("indicators_at_entry",sig.get("indicators",[]))
+                meta_score=await meta_should_trade(feature_row,threshold=float(config.get("meta_labeler_threshold",0.45)))
+                if meta_score.get("ready") and not meta_score.get("allow"):
+                    skipped.append({"ticker":ticker,"reason":"meta_labeler_reject","p_win":meta_score.get("p_win"),"threshold":meta_score.get("threshold")}); continue
+            except Exception as e: _log.debug(f"meta labeler gate skipped: {e}")
         entry=float(sig.get("price") or sig.get("entry_price") or 0)
         if entry<=0: skipped.append({"ticker":ticker,"reason":"missing_price"}); continue
         # Leverage multiplies notional exposure for a given margin (position_pct of capital).
@@ -188,7 +211,7 @@ async def scan_and_execute():
         if config.get("use_stops",True) and item.get("source")!="auto_signals": sl=optimal_trailing_stop(entry,entry,atr_val,0,200,"long" if "BUY" in final_sig else "short")["optimal_stop"]
         else: sl=float(sig.get("sl") or entry*(0.97 if "BUY" in final_sig else 1.03))
         tp=float(sig.get("tp") or entry*(1.06 if "BUY" in final_sig else 0.94))
-        trade={"ticker":ticker,"asset_type":atype,"signal":final_sig,"confidence":final_conf,"entry_price":entry,"quantity":round(qty,6),"original_quantity":round(qty,6),"position_value":round(capital*pos_pct/100*leverage,2),"margin_used":round(capital*pos_pct/100,2),"leverage":leverage,"profile":config.get("profile"),"position_pct":round(pos_pct,2),"sl":round(sl,4),"initial_sl":round(sl,4),"tp":round(tp,4),"atr":round(atr_val,4),"partial_taken":False,"realized_pnl_pct":0.0,"trailing_active":False,"mtf_status":mtf_status,"mtf_htf_timeframe":(mtf_doc or {}).get("timeframe"),"mtf_htf_signal":(mtf_doc or {}).get("signal"),"mtf_confidence_adj":mtf_conf_adj,"regime":regime,"timeframe":sig.get("timeframe",tf),"status":"open","paper_mode":config.get("paper_mode",True),"opened_at":datetime.utcnow().isoformat(),"source":item.get("source"),"auto_signal_id":str(sig.get("_id","")),"diagnostic_source":bool(sig.get("diagnostic_only")),"scanner_score":sig.get("scanner_score"),"quant_powered":config.get("use_quant",True),"rl_state":rl_state_key,"rl_action":rl_action_idx,"rl_size_mult":rl_size_mult,"meta_p_win":meta.get("p_win",None),"indicators_at_entry":sig.get("indicators",[]),"enhancements_at_entry":sig.get("enhancements",{}),"entropy_tradeable":next((i.get("tradeable",True) for i in sig.get("indicators",[]) if i.get("indicator")=="ENTROPY"),True)}
+        trade={"ticker":ticker,"asset_type":atype,"signal":final_sig,"confidence":final_conf,"entry_price":entry,"quantity":round(qty,6),"original_quantity":round(qty,6),"position_value":round(capital*pos_pct/100*leverage,2),"margin_used":round(capital*pos_pct/100,2),"leverage":leverage,"profile":config.get("profile"),"position_pct":round(pos_pct,2),"sl":round(sl,4),"initial_sl":round(sl,4),"tp":round(tp,4),"atr":round(atr_val,4),"partial_taken":False,"realized_pnl_pct":0.0,"trailing_active":False,"mtf_status":mtf_status,"mtf_htf_timeframe":(mtf_doc or {}).get("timeframe"),"mtf_htf_signal":(mtf_doc or {}).get("signal"),"mtf_confidence_adj":mtf_conf_adj,"bayes_multiplier":round(bayes_mult,4),"bayes_evaluated":bayes_eval.get("evaluated",0),"meta_p_win":meta_score.get("p_win"),"meta_kind":meta_score.get("kind"),"regime":regime,"timeframe":sig.get("timeframe",tf),"status":"open","paper_mode":config.get("paper_mode",True),"opened_at":datetime.utcnow().isoformat(),"source":item.get("source"),"auto_signal_id":str(sig.get("_id","")),"diagnostic_source":bool(sig.get("diagnostic_only")),"scanner_score":sig.get("scanner_score"),"quant_powered":config.get("use_quant",True),"rl_state":rl_state_key,"rl_action":rl_action_idx,"rl_size_mult":rl_size_mult,"meta_learner_p_win":meta.get("p_win",None),"indicators_at_entry":sig.get("indicators",[]),"enhancements_at_entry":sig.get("enhancements",{}),"entropy_tradeable":next((i.get("tradeable",True) for i in sig.get("indicators",[]) if i.get("indicator")=="ENTROPY"),True)}
         await trades_col.insert_one(trade); executed.append({"ticker":ticker,"signal":final_sig,"entry":entry,"size":round(pos_pct,2),"source":item.get("source"),"confidence":final_conf}); open_cnt+=1
         await _alog(f"Opened paper trade from {item.get('source')}: {final_sig} {ticker} conf={final_conf} entry={entry}","success",executed[-1])
     return {"status":"scanned","source":config.get("signal_source","hybrid"),"candidates":len(items),"executed":len(executed),"trades":executed,"skipped":skipped[:50],"rl_decisions":rl_decisions,"defensive_mode":defensive_adj}
@@ -235,8 +258,23 @@ async def monitor_open():
             outcome="WIN" if total_pnl>0 else "LOSS"
             close_reason="TRAIL" if hit_sl and bool(trade.get("trailing_active")) else ("TP" if hit_tp else "SL")
             await trades_col.update_one({"_id":trade["_id"]},{"$set":{"status":"closed","close_price":price,"close_reason":close_reason,"pnl_pct":round(total_pnl,3),"outcome":outcome,"closed_at":datetime.utcnow().isoformat()}})
-            await hist_col.insert_one({**{k:v for k,v in trade.items() if k!="_id"},"close_price":price,"pnl_pct":round(total_pnl,3),"outcome":outcome,"closed_at":datetime.utcnow().isoformat(),"close_reason":close_reason})
+            closed_trade={**{k:v for k,v in trade.items() if k!="_id"},"close_price":price,"pnl_pct":round(total_pnl,3),"outcome":outcome,"closed_at":datetime.utcnow().isoformat(),"close_reason":close_reason}
+            await hist_col.insert_one(closed_trade)
             closed.append({"ticker":ticker,"outcome":outcome,"pnl":round(total_pnl,3),"reason":close_reason})
+            # ---- Self-learning loops on real trade outcomes ----
+            if config.get("use_bayesian_online",True):
+                try:
+                    from services.bayesian_online_weights import update_from_trade as _bo_update
+                    await _bo_update(closed_trade)
+                except Exception as e: _log.debug(f"bayesian online update failed: {e}")
+            try:
+                from services.weight_engine import update_weights as _we_update
+                await _we_update(outcome,sig,trade.get("indicators_at_entry",[]),float(total_pnl),float(trade.get("confidence",50) or 50))
+            except Exception as e: _log.debug(f"weight engine update failed: {e}")
+            try:
+                from services.bayesian_engine import update_likelihoods_from_outcome as _be_update
+                await _be_update(trade.get("regime","RANGING"),trade.get("indicators_at_entry",[]),sig,outcome=="WIN")
+            except Exception as e: _log.debug(f"bayesian engine update failed: {e}")
             continue
         # ---- Partial take-profit at +Nx ATR ----
         unreal_per_unit=(price-entry) if side=="BUY" else (entry-price)
@@ -260,7 +298,18 @@ async def monitor_open():
                     trailed.append({"ticker":ticker,"old_sl":sl,"new_sl":round(new_stop,6),"price":price})
             except Exception as e:
                 _log.debug(f"trail update failed for {ticker}: {e}")
-    return {"monitored":len(trades),"closed":len(closed),"partials":len(partials),"trailed":len(trailed),"details":closed,"partial_details":partials,"trail_details":trailed}
+    # ---- Periodic meta-labeller retrain (every N closes) ----
+    retrained=None
+    if closed and config.get("use_meta_labeler",True):
+        try:
+            n_since=await hist_col.count_documents({"outcome":{"$in":["WIN","LOSS"]}})
+            retrain_every=max(5,int(config.get("meta_labeler_retrain_every",25)))
+            if n_since and n_since%retrain_every==0:
+                from services.meta_labeler import train_from_history as _ml_train
+                retrained=await _ml_train()
+                await _alog(f"Meta-labeller retrained: {retrained}","info",retrained)
+        except Exception as e: _log.debug(f"meta labeler retrain failed: {e}")
+    return {"monitored":len(trades),"closed":len(closed),"partials":len(partials),"trailed":len(trailed),"details":closed,"partial_details":partials,"trail_details":trailed,"meta_labeler_retrain":retrained}
 _running=False
 async def start_scheduler():
     global _running
